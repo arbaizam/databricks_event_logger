@@ -17,4 +17,6 @@ The v1 design is documented in [docs/databricks-event-logger-design-spec.md](doc
 
 ## Bundle
 
-The active bundle file is [databricks.yaml](databricks.yaml). It builds the package wheel through the Asset Bundle artifact configuration and exposes configurable observability table variables.
+Asset Bundle configuration lives outside the committed package source. The local
+`databricks.yaml` file is intentionally ignored so environment-specific bundle
+settings do not enter the package repository.

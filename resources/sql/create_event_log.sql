@@ -2,22 +2,22 @@
 -- The deployment layer is responsible for substituting the table name and managing grants/retention.
 
 CREATE TABLE IF NOT EXISTS ${observability_event_table} (
+  event_name STRING NOT NULL,
+  event_type STRING NOT NULL,
+  status STRING NOT NULL,
   event_id STRING NOT NULL,
   correlation_id STRING,
   parent_event_id STRING,
-  event_ts TIMESTAMP,
-  event_date DATE,
+  event_ts TIMESTAMP NOT NULL,
+  event_date DATE NOT NULL,
   start_ts TIMESTAMP,
   end_ts TIMESTAMP,
   duration_ms BIGINT,
-  event_name STRING,
-  event_type STRING,
-  status STRING,
   severity STRING,
   app_name STRING,
   component STRING,
   environment STRING,
-  sdk_version STRING,
+  sdk_version STRING NOT NULL,
   workspace_id STRING,
   workspace_url STRING,
   cluster_id STRING,
@@ -36,6 +36,6 @@ CREATE TABLE IF NOT EXISTS ${observability_event_table} (
   error_message STRING,
   stack_trace_hash STRING,
   metadata_json STRING,
-  created_at TIMESTAMP
+  created_at TIMESTAMP NOT NULL
 )
 USING DELTA;
