@@ -1,0 +1,41 @@
+-- Template DDL for the configured event log table.
+-- The deployment layer is responsible for substituting the table name and managing grants/retention.
+
+CREATE TABLE IF NOT EXISTS ${observability_event_table} (
+  event_id STRING NOT NULL,
+  correlation_id STRING,
+  parent_event_id STRING,
+  event_ts TIMESTAMP,
+  event_date DATE,
+  start_ts TIMESTAMP,
+  end_ts TIMESTAMP,
+  duration_ms BIGINT,
+  event_name STRING,
+  event_type STRING,
+  status STRING,
+  severity STRING,
+  app_name STRING,
+  component STRING,
+  environment STRING,
+  sdk_version STRING,
+  workspace_id STRING,
+  workspace_url STRING,
+  cluster_id STRING,
+  job_id STRING,
+  run_id STRING,
+  task_key STRING,
+  task_attempt_number STRING,
+  notebook_path STRING,
+  user_name STRING,
+  source_table STRING,
+  target_table STRING,
+  row_count BIGINT,
+  metric_name STRING,
+  metric_value DOUBLE,
+  error_class STRING,
+  error_message STRING,
+  stack_trace_hash STRING,
+  metadata_json STRING,
+  created_at TIMESTAMP
+)
+USING DELTA;

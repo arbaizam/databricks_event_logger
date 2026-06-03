@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "databricks-event-logger"
+version = "0.1.0"
+description = "Structured event logging helpers for Databricks workloads."
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [
+  { name = "Databricks Event Logger Maintainers" }
+]
+dependencies = []
+
+[project.optional-dependencies]
+dev = [
+  "build",
+  "pytest",
+  "ruff"
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+  "integration: tests that require Databricks runtime resources"
+]
+
+[tool.ruff]
+line-length = 100
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]

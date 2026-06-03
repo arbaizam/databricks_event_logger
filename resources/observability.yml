@@ -1,0 +1,4 @@
+# Placeholder resource file included by databricks.yaml.
+# Add Databricks jobs, SQL tasks, or dashboards here as implementation proceeds.
+
+resources: {}

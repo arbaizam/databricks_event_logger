@@ -1,0 +1,1 @@
+"""Base sink protocol."""

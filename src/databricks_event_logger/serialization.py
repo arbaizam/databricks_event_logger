@@ -1,0 +1,1 @@
+"""Metadata serialization helpers."""
