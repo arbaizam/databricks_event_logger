@@ -633,7 +633,11 @@ class NotebookObserver:
         ``environment``, and ``observability_event_table``. When ``dbutils`` or
         ``spark`` are omitted, this method performs a bounded lookup through
         caller frames for notebook globals with those names. Passing them
-        explicitly is preferred for package code and tests.
+        explicitly is preferred for package code and tests. Optional widgets
+        named ``workspace_id``, ``workspace_url``, ``cluster_id``, ``job_id``,
+        ``run_id``, ``task_key``, ``task_attempt_number``, ``notebook_path``,
+        and ``user_name`` are used as context fallbacks when the Databricks
+        runtime context does not expose those fields directly.
 
         Parameters
         ----------
@@ -653,6 +657,11 @@ class NotebookObserver:
         """
         resolved_dbutils = dbutils or _caller_global("dbutils")
         resolved_spark = spark or _caller_global("spark")
+        context = resolve_databricks_context(
+            dbutils=resolved_dbutils,
+            spark=resolved_spark,
+            fallback=_context_from_widgets(resolved_dbutils),
+        )
         return self(
             app_name=_widget_value(resolved_dbutils, "app_name"),
             component=_widget_value(resolved_dbutils, "component"),
@@ -661,6 +670,7 @@ class NotebookObserver:
             sink=sink,
             spark=resolved_spark,
             dbutils=resolved_dbutils,
+            context=context,
         )
 
 
@@ -690,6 +700,17 @@ def _widget_value(dbutils: Any | None, name: str) -> str | None:
         return None
     text = str(value).strip()
     return text or None
+
+
+def _context_from_widgets(dbutils: Any | None) -> dict[str, str | None]:
+    """
+    Return optional runtime context fallback values from Databricks widgets.
+    """
+    values: dict[str, str] = {}
+    for field in RuntimeContext.__dataclass_fields__:
+        if value := _widget_value(dbutils, field):
+            values[field] = value
+    return values
 
 
 def _caller_global(name: str, *, max_depth: int = 10) -> Any | None:

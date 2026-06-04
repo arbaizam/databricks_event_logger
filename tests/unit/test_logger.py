@@ -204,6 +204,33 @@ def test_observed_decorator_uses_default_logger_at_call_time():
     Context().run(run)
 
 
+def test_observe_notebook_from_widgets_uses_optional_context_widgets():
+    """
+    What: Uses optional widget values as runtime context fallbacks.
+    Why: Databricks exposes task name/execution count as dynamic task parameters.
+    Fails when: Job task smoke tests cannot populate task_key or attempt fields.
+    """
+    sink = MemorySink()
+    dbutils = FakeDbutils(
+        {
+            "app_name": "app",
+            "component": "component",
+            "environment": "dev",
+            "observability_event_table": "catalog.schema.event_log",
+            "task_key": "smoke_task",
+            "task_attempt_number": "1",
+            "notebook_path": "/Workspace/smoke",
+        }
+    )
+
+    logger = observe_notebook.from_widgets(dbutils=dbutils, sink=sink)
+
+    assert logger.context.task_key == "smoke_task"
+    assert logger.context.task_attempt_number == "1"
+    assert logger.context.notebook_path == "/Workspace/smoke"
+    assert sink.events[-1].task_key == "smoke_task"
+
+
 def test_get_default_logger_requires_bootstrap():
     """
     What: Raises a clear configuration error when no default logger exists.
@@ -212,3 +239,18 @@ def test_get_default_logger_requires_bootstrap():
     """
     with pytest.raises(EventLoggerConfigurationError):
         Context().run(get_default_logger)
+
+
+class FakeDbutils:
+    def __init__(self, widget_values):
+        self.widgets = FakeWidgets(widget_values)
+
+
+class FakeWidgets:
+    def __init__(self, values):
+        self._values = values
+
+    def get(self, name):
+        if name not in self._values:
+            raise KeyError(name)
+        return self._values[name]
