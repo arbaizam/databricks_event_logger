@@ -9,6 +9,7 @@ Python interpreter inside a Databricks cluster. Missing fields should produce
 
 from __future__ import annotations
 
+import json
 import os
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -185,21 +186,71 @@ def _context_from_dbutils(dbutils: Any | None) -> dict[str, str]:
     except Exception:
         return {}
 
-    tag_map = {
+    values: dict[str, str] = {}
+    sources = [
+        _context_from_json(context),
+        _context_from_tags(context),
+        _context_from_methods(context),
+    ]
+    for source in sources:
+        for field, value in source.items():
+            if value and field not in values:
+                values[field] = value
+    return values
+
+
+def _context_from_json(context: Any) -> dict[str, str]:
+    """
+    Return context fields from Databricks context JSON.
+
+    Databricks runtimes expose slightly different tag maps across interactive
+    notebooks, job tasks, and runtime versions. ``toJson()`` is often the most
+    complete view because it includes nested ``tags`` and ``extraContext``.
+    """
+    try:
+        raw_json = context.toJson()
+    except Exception:
+        return {}
+    try:
+        payload = json.loads(str(raw_json))
+    except (TypeError, ValueError):
+        return {}
+    flattened = _flatten_context_payload(payload)
+    return _context_fields_from_mapping(flattened)
+
+
+def _context_from_tags(context: Any) -> dict[str, str]:
+    """
+    Return context fields from Databricks context tags.
+    """
+    values: dict[str, str] = {}
+    for field, tag_names in _CONTEXT_KEY_MAP.items():
+        for tag_name in tag_names:
+            if value := _context_tag(context, tag_name):
+                values[field] = value
+                break
+    return values
+
+
+def _context_from_methods(context: Any) -> dict[str, str]:
+    """
+    Return context fields from direct notebook context methods when available.
+    """
+    method_map = {
         "workspace_id": ("orgId", "workspaceId"),
         "workspace_url": ("browserHostName", "apiUrl"),
         "cluster_id": ("clusterId",),
         "job_id": ("jobId",),
-        "run_id": ("jobRunId", "runId"),
+        "run_id": ("currentRunId", "rootRunId", "runId", "jobRunId"),
         "task_key": ("taskKey",),
         "task_attempt_number": ("taskAttemptNumber",),
-        "notebook_path": ("notebook_path", "notebookPath"),
-        "user_name": ("user", "userName"),
+        "notebook_path": ("notebookPath",),
+        "user_name": ("userName", "user"),
     }
     values: dict[str, str] = {}
-    for field, tag_names in tag_map.items():
-        for tag_name in tag_names:
-            if value := _context_tag(context, tag_name):
+    for field, method_names in method_map.items():
+        for method_name in method_names:
+            if value := _context_method_value(context, method_name):
                 values[field] = value
                 break
     return values
@@ -221,6 +272,68 @@ def _context_tag(context: Any, tag_name: str) -> str | None:
         return None
 
 
+def _context_method_value(context: Any, method_name: str) -> str | None:
+    """
+    Read one optional value from a Databricks notebook context method.
+    """
+    try:
+        method = getattr(context, method_name)
+    except Exception:
+        return None
+    if not callable(method):
+        return _extract_context_value(method)
+    try:
+        return _extract_context_value(method())
+    except Exception:
+        return None
+
+
+def _context_fields_from_mapping(values: Mapping[str, Any]) -> dict[str, str]:
+    """
+    Map Databricks context key variants to package context fields.
+    """
+    output: dict[str, str] = {}
+    for field, key_names in _CONTEXT_KEY_MAP.items():
+        for key_name in key_names:
+            if value := _extract_context_value(values.get(key_name)):
+                output[field] = value
+                break
+    return output
+
+
+def _flatten_context_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
+    """
+    Flatten the Databricks context JSON sections that contain runtime fields.
+    """
+    flattened: dict[str, Any] = dict(payload)
+    for section_name in ("tags", "extraContext"):
+        section = payload.get(section_name)
+        if isinstance(section, Mapping):
+            flattened.update(section)
+    return flattened
+
+
+def _extract_context_value(value: Any) -> str | None:
+    """
+    Return a simple string from Databricks Option, run id, or primitive values.
+    """
+    if value is None:
+        return None
+    try:
+        if isinstance(value, Mapping):
+            for key in ("id", "value", "name"):
+                if extracted := _extract_context_value(value.get(key)):
+                    return extracted
+            return None
+        if hasattr(value, "isDefined") and not value.isDefined():
+            return None
+        if hasattr(value, "get"):
+            return _extract_context_value(value.get())
+    except Exception:
+        return None
+    return _string_or_none(value)
+
+
 def _string_or_none(value: Any) -> str | None:
     """
     Convert a context value to ``str`` while preserving missing values.
@@ -229,3 +342,29 @@ def _string_or_none(value: Any) -> str | None:
         return None
     text = str(value).strip()
     return text or None
+
+
+_CONTEXT_KEY_MAP = {
+    "workspace_id": ("orgId", "workspaceId", "workspace_id", "workspaceId"),
+    "workspace_url": ("browserHostName", "apiUrl", "workspaceUrl", "workspace_url"),
+    "cluster_id": ("clusterId", "cluster_id"),
+    "job_id": ("jobId", "job_id"),
+    "run_id": (
+        "jobRunId",
+        "runId",
+        "currentRunId",
+        "rootRunId",
+        "job_run_id",
+        "run_id",
+    ),
+    "task_key": ("taskKey", "task_key"),
+    "task_attempt_number": (
+        "taskAttemptNumber",
+        "taskAttempt",
+        "jobRunAttempt",
+        "jobRunOriginalAttempt",
+        "task_attempt_number",
+    ),
+    "notebook_path": ("notebook_path", "notebookPath", "notebookPathInWorkspace"),
+    "user_name": ("user", "userName", "userEmail", "email"),
+}
