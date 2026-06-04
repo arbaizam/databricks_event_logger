@@ -58,12 +58,16 @@ def test_context_resolver_uses_dbutils_context_json_for_job_fields():
         "tags": {
             "jobId": "123",
             "taskKey": "smoke_task",
+            "taskRunId": "789",
             "taskAttemptNumber": "2",
+            "jobTriggerType": "one_time",
             "browserHostName": "adb-123.azuredatabricks.net",
         },
         "extraContext": {
+            "job_start_time": "2026-06-04T13:00:00Z",
             "notebook_path": "/Repos/team/event_logger_smoke",
             "user": "user@example.com",
+            "run_as_user_name": "svc@example.com",
         },
     }
     dbutils = FakeDbutils(FakeNotebookContext(json_payload=payload))
@@ -73,10 +77,14 @@ def test_context_resolver_uses_dbutils_context_json_for_job_fields():
     assert context.job_id == "123"
     assert context.run_id == "456"
     assert context.task_key == "smoke_task"
+    assert context.task_run_id == "789"
     assert context.task_attempt_number == "2"
+    assert context.job_start_time == "2026-06-04T13:00:00Z"
+    assert context.job_trigger_type == "one_time"
     assert context.notebook_path == "/Repos/team/event_logger_smoke"
     assert context.workspace_url == "adb-123.azuredatabricks.net"
     assert context.user_name == "user@example.com"
+    assert context.run_as_user_name == "svc@example.com"
 
 
 def test_context_resolver_uses_dbutils_tags_when_json_is_unavailable():
@@ -91,6 +99,8 @@ def test_context_resolver_uses_dbutils_tags_when_json_is_unavailable():
                 "jobId": "123",
                 "jobRunId": "456",
                 "taskKey": "smoke_task",
+                "taskRunId": "789",
+                "taskAttemptNumber": "1",
                 "notebookPath": "/Workspace/smoke",
             }
         )
@@ -101,6 +111,8 @@ def test_context_resolver_uses_dbutils_tags_when_json_is_unavailable():
     assert context.job_id == "123"
     assert context.run_id == "456"
     assert context.task_key == "smoke_task"
+    assert context.task_run_id == "789"
+    assert context.task_attempt_number == "1"
     assert context.notebook_path == "/Workspace/smoke"
 
 

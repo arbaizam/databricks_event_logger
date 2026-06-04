@@ -66,6 +66,8 @@ def test_delta_sink_inserts_through_sql_with_typed_staging_view():
 
     assert spark.data[0]["event_name"] == "reporting.delta_write"
     assert spark.schema["event_name"].nullable is False
+    assert spark.schema["task_run_id"].nullable is True
+    assert spark.schema["job_trigger_type"].nullable is True
     assert spark.schema["metadata_json"].nullable is True
     assert spark.dataframe.view_name.startswith("databricks_event_logger_event_")
     assert spark.sql_calls[0].startswith("INSERT INTO catalog.schema.event_log")

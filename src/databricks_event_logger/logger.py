@@ -635,9 +635,11 @@ class NotebookObserver:
         caller frames for notebook globals with those names. Passing them
         explicitly is preferred for package code and tests. Optional widgets
         named ``workspace_id``, ``workspace_url``, ``cluster_id``, ``job_id``,
-        ``run_id``, ``task_key``, ``task_attempt_number``, ``notebook_path``,
-        and ``user_name`` are used as context fallbacks when the Databricks
-        runtime context does not expose those fields directly.
+        ``run_id``, ``task_key``, ``task_run_id``,
+        ``task_attempt_number``, ``job_start_time``, ``job_trigger_type``,
+        ``notebook_path``, ``user_name``, and ``run_as_user_name`` are used as
+        context fallbacks when the Databricks runtime context does not expose
+        those fields directly.
 
         Parameters
         ----------
@@ -657,16 +659,17 @@ class NotebookObserver:
         """
         resolved_dbutils = dbutils or _caller_global("dbutils")
         resolved_spark = spark or _caller_global("spark")
+        widget_values = _widget_values(resolved_dbutils)
         context = resolve_databricks_context(
             dbutils=resolved_dbutils,
             spark=resolved_spark,
-            fallback=_context_from_widgets(resolved_dbutils),
+            fallback=_context_from_widgets(widget_values),
         )
         return self(
-            app_name=_widget_value(resolved_dbutils, "app_name"),
-            component=_widget_value(resolved_dbutils, "component"),
-            environment=_widget_value(resolved_dbutils, "environment"),
-            event_table=_widget_value(resolved_dbutils, "observability_event_table"),
+            app_name=_widget_value(widget_values, "app_name"),
+            component=_widget_value(widget_values, "component"),
+            environment=_widget_value(widget_values, "environment"),
+            event_table=_widget_value(widget_values, "observability_event_table"),
             sink=sink,
             spark=resolved_spark,
             dbutils=resolved_dbutils,
@@ -688,9 +691,88 @@ def _stack_trace_hash(exc: BaseException) -> str:
     return hashlib.sha256(trace_text.encode("utf-8")).hexdigest()
 
 
-def _widget_value(dbutils: Any | None, name: str) -> str | None:
+def _widget_values(dbutils: Any | None) -> dict[str, str]:
     """
-    Read one Databricks widget value.
+    Return all visible Databricks widget values.
+    """
+    if dbutils is None:
+        return {}
+    values: dict[str, str] = {}
+    try:
+        raw_values = dbutils.widgets.getAll()
+    except Exception:
+        raw_values = {}
+    try:
+        items = raw_values.items()
+    except Exception:
+        items = ()
+    for key, value in items:
+        if text := _string_or_none(value):
+            values[str(key)] = text
+    for name in _KNOWN_WIDGET_NAMES:
+        if name not in values and (value := _legacy_widget_value(dbutils, name)):
+            values[name] = value
+    return values
+
+
+def _widget_value(values: dict[str, str], name: str) -> str | None:
+    """
+    Read one Databricks widget value from a captured widget mapping.
+    """
+    return values.get(name)
+
+
+def _context_from_widgets(values: dict[str, str]) -> dict[str, str | None]:
+    """
+    Return optional runtime context fallback values from Databricks widgets.
+    """
+    context_values: dict[str, str] = {}
+    for field, widget_names in _WIDGET_CONTEXT_KEY_MAP.items():
+        for widget_name in widget_names:
+            if value := values.get(widget_name):
+                context_values[field] = value
+                break
+    return context_values
+
+
+def _string_or_none(value: Any) -> str | None:
+    """
+    Convert a widget value to ``str`` while preserving missing values.
+    """
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+_WIDGET_CONTEXT_KEY_MAP = {
+    "workspace_id": ("workspace_id",),
+    "workspace_url": ("workspace_url",),
+    "cluster_id": ("cluster_id",),
+    "job_id": ("job_id",),
+    "run_id": ("run_id", "job_run_id"),
+    "task_key": ("task_key", "task_name"),
+    "task_run_id": ("task_run_id",),
+    "task_attempt_number": ("task_attempt_number", "task_execution_count"),
+    "job_start_time": ("job_start_time",),
+    "job_trigger_type": ("job_trigger_type",),
+    "notebook_path": ("notebook_path",),
+    "user_name": ("user_name",),
+    "run_as_user_name": ("run_as_user_name",),
+}
+
+_KNOWN_WIDGET_NAMES = (
+    "app_name",
+    "component",
+    "environment",
+    "observability_event_table",
+    *tuple(name for names in _WIDGET_CONTEXT_KEY_MAP.values() for name in names),
+)
+
+
+def _legacy_widget_value(dbutils: Any | None, name: str) -> str | None:
+    """
+    Read one Databricks widget value using the direct widget API.
     """
     if dbutils is None:
         return None
@@ -700,17 +782,6 @@ def _widget_value(dbutils: Any | None, name: str) -> str | None:
         return None
     text = str(value).strip()
     return text or None
-
-
-def _context_from_widgets(dbutils: Any | None) -> dict[str, str | None]:
-    """
-    Return optional runtime context fallback values from Databricks widgets.
-    """
-    values: dict[str, str] = {}
-    for field in RuntimeContext.__dataclass_fields__:
-        if value := _widget_value(dbutils, field):
-            values[field] = value
-    return values
 
 
 def _caller_global(name: str, *, max_depth: int = 10) -> Any | None:

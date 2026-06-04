@@ -35,12 +35,20 @@ class RuntimeContext:
         Databricks job run identifier.
     task_key : str | None
         Databricks task key within the job.
+    task_run_id : str | None
+        Databricks task run identifier when available.
     task_attempt_number : str | None
         Databricks task attempt number when available.
+    job_start_time : str | None
+        Databricks job start time when supplied by dynamic task parameters.
+    job_trigger_type : str | None
+        Databricks job trigger type such as ``one_time`` or ``periodic``.
     notebook_path : str | None
         Notebook path for notebook-backed tasks.
     user_name : str | None
         User name associated with the current run when available.
+    run_as_user_name : str | None
+        Principal the job runs as when supplied by callers.
     """
 
     workspace_id: str | None = None
@@ -49,9 +57,13 @@ class RuntimeContext:
     job_id: str | None = None
     run_id: str | None = None
     task_key: str | None = None
+    task_run_id: str | None = None
     task_attempt_number: str | None = None
+    job_start_time: str | None = None
+    job_trigger_type: str | None = None
     notebook_path: str | None = None
     user_name: str | None = None
+    run_as_user_name: str | None = None
 
     @classmethod
     def from_mapping(cls, values: Mapping[str, Any] | None) -> RuntimeContext:
@@ -89,9 +101,13 @@ class RuntimeContext:
             "job_id": self.job_id,
             "run_id": self.run_id,
             "task_key": self.task_key,
+            "task_run_id": self.task_run_id,
             "task_attempt_number": self.task_attempt_number,
+            "job_start_time": self.job_start_time,
+            "job_trigger_type": self.job_trigger_type,
             "notebook_path": self.notebook_path,
             "user_name": self.user_name,
+            "run_as_user_name": self.run_as_user_name,
         }
 
 
@@ -141,8 +157,12 @@ def _context_from_environment() -> dict[str, str]:
         "job_id": "DATABRICKS_JOB_ID",
         "run_id": "DATABRICKS_RUN_ID",
         "task_key": "DATABRICKS_TASK_KEY",
+        "task_run_id": "DATABRICKS_TASK_RUN_ID",
         "task_attempt_number": "DATABRICKS_TASK_ATTEMPT_NUMBER",
+        "job_start_time": "DATABRICKS_JOB_START_TIME",
+        "job_trigger_type": "DATABRICKS_JOB_TRIGGER_TYPE",
         "user_name": "DATABRICKS_USER",
+        "run_as_user_name": "DATABRICKS_RUN_AS_USER",
     }
     return {
         field: value
@@ -243,9 +263,13 @@ def _context_from_methods(context: Any) -> dict[str, str]:
         "job_id": ("jobId",),
         "run_id": ("currentRunId", "rootRunId", "runId", "jobRunId"),
         "task_key": ("taskKey",),
+        "task_run_id": ("taskRunId", "taskRunID"),
         "task_attempt_number": ("taskAttemptNumber",),
+        "job_start_time": ("jobStartTime", "jobStartTimestamp", "startTime"),
+        "job_trigger_type": ("jobTriggerType", "triggerType"),
         "notebook_path": ("notebookPath",),
         "user_name": ("userName", "user"),
+        "run_as_user_name": ("runAsUserName", "runAsUser", "runAs"),
     }
     values: dict[str, str] = {}
     for field, method_names in method_map.items():
@@ -358,13 +382,30 @@ _CONTEXT_KEY_MAP = {
         "run_id",
     ),
     "task_key": ("taskKey", "task_key"),
+    "task_run_id": ("taskRunId", "task_run_id", "task.run_id"),
     "task_attempt_number": (
         "taskAttemptNumber",
         "taskAttempt",
         "jobRunAttempt",
         "jobRunOriginalAttempt",
         "task_attempt_number",
+        "taskExecutionCount",
+        "task_execution_count",
+        "task.execution_count",
+    ),
+    "job_start_time": (
+        "jobStartTime",
+        "job_start_time",
+        "job.start_time.iso_datetime",
+        "startTime",
+    ),
+    "job_trigger_type": (
+        "jobTriggerType",
+        "job_trigger_type",
+        "job.trigger.type",
+        "triggerType",
     ),
     "notebook_path": ("notebook_path", "notebookPath", "notebookPathInWorkspace"),
     "user_name": ("user", "userName", "userEmail", "email"),
+    "run_as_user_name": ("runAsUserName", "run_as_user_name", "runAsUser", "run_as"),
 }

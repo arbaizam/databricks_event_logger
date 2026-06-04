@@ -218,17 +218,26 @@ def test_observe_notebook_from_widgets_uses_optional_context_widgets():
             "environment": "dev",
             "observability_event_table": "catalog.schema.event_log",
             "task_key": "smoke_task",
+            "task_run_id": "task-run-1",
             "task_attempt_number": "1",
+            "job_start_time": "2026-06-04T13:00:00Z",
+            "job_trigger_type": "one_time",
             "notebook_path": "/Workspace/smoke",
+            "run_as_user_name": "svc@example.com",
         }
     )
 
     logger = observe_notebook.from_widgets(dbutils=dbutils, sink=sink)
 
     assert logger.context.task_key == "smoke_task"
+    assert logger.context.task_run_id == "task-run-1"
     assert logger.context.task_attempt_number == "1"
+    assert logger.context.job_start_time == "2026-06-04T13:00:00Z"
+    assert logger.context.job_trigger_type == "one_time"
     assert logger.context.notebook_path == "/Workspace/smoke"
+    assert logger.context.run_as_user_name == "svc@example.com"
     assert sink.events[-1].task_key == "smoke_task"
+    assert sink.events[-1].task_run_id == "task-run-1"
 
 
 def test_get_default_logger_requires_bootstrap():
@@ -254,3 +263,6 @@ class FakeWidgets:
         if name not in self._values:
             raise KeyError(name)
         return self._values[name]
+
+    def getAll(self):  # noqa: N802 - Databricks widget API casing.
+        return dict(self._values)

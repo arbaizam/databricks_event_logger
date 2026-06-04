@@ -82,9 +82,13 @@ class EventRecord:
     job_id: str | None
     run_id: str | None
     task_key: str | None
+    task_run_id: str | None
     task_attempt_number: str | None
+    job_start_time: str | None
+    job_trigger_type: str | None
     notebook_path: str | None
     user_name: str | None
+    run_as_user_name: str | None
 
     source_table: str | None
     target_table: str | None
@@ -170,9 +174,13 @@ class EventRecord:
         self.job_id = context_values.get("job_id")
         self.run_id = context_values.get("run_id")
         self.task_key = context_values.get("task_key")
+        self.task_run_id = context_values.get("task_run_id")
         self.task_attempt_number = context_values.get("task_attempt_number")
+        self.job_start_time = context_values.get("job_start_time")
+        self.job_trigger_type = context_values.get("job_trigger_type")
         self.notebook_path = context_values.get("notebook_path")
         self.user_name = context_values.get("user_name")
+        self.run_as_user_name = context_values.get("run_as_user_name")
         self.source_table = source_table
         self.target_table = target_table
         self.row_count = row_count

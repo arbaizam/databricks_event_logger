@@ -626,9 +626,13 @@ CREATE TABLE IF NOT EXISTS observability.event_log (
   job_id STRING,
   run_id STRING,
   task_key STRING,
+  task_run_id STRING,
   task_attempt_number STRING,
+  job_start_time STRING,
+  job_trigger_type STRING,
   notebook_path STRING,
   user_name STRING,
+  run_as_user_name STRING,
 
   source_table STRING,
   target_table STRING,
@@ -846,9 +850,13 @@ The SDK should capture these Databricks fields where available:
 - `job_id`
 - `run_id`
 - `task_key`
+- `task_run_id`
 - `task_attempt_number`
+- `job_start_time`
+- `job_trigger_type`
 - `notebook_path`
 - `user_name`
+- `run_as_user_name`
 
 When a Databricks context field is unavailable, context resolution must return nulls rather than failing. This keeps tests and non-job execution paths simple.
 

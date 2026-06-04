@@ -20,7 +20,16 @@ def test_event_record_serializes_metadata_and_context():
         app_name="app",
         component="component",
         environment="dev",
-        context=RuntimeContext(job_id="job-1", run_id="run-1", task_key="task"),
+        context=RuntimeContext(
+            job_id="job-1",
+            run_id="run-1",
+            task_key="task",
+            task_run_id="task-run-1",
+            task_attempt_number="1",
+            job_start_time="2026-06-03T12:00:00Z",
+            job_trigger_type="one_time",
+            run_as_user_name="svc@example.com",
+        ),
         metadata={"amount": Decimal("12.30"), "as_of_date": datetime(2026, 6, 3, tzinfo=UTC)},
     )
 
@@ -32,6 +41,11 @@ def test_event_record_serializes_metadata_and_context():
     assert row["job_id"] == "job-1"
     assert row["run_id"] == "run-1"
     assert row["task_key"] == "task"
+    assert row["task_run_id"] == "task-run-1"
+    assert row["task_attempt_number"] == "1"
+    assert row["job_start_time"] == "2026-06-03T12:00:00Z"
+    assert row["job_trigger_type"] == "one_time"
+    assert row["run_as_user_name"] == "svc@example.com"
     assert metadata["amount"] == "12.30"
     assert metadata["as_of_date"] == "2026-06-03T00:00:00+00:00"
 
