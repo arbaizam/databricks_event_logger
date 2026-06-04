@@ -597,13 +597,20 @@ class NotebookObserver:
             Databricks dbutils object for context capture.
         context : RuntimeContext | None, default None
             Explicit runtime context.
+            When omitted and ``dbutils`` is supplied, optional context widgets
+            such as ``task_key`` and ``task_run_id`` are used as fallbacks.
 
         Returns
         -------
         EventLogger
             Configured default logger.
         """
-        resolved_context = context or resolve_databricks_context(dbutils=dbutils, spark=spark)
+        widget_values = _widget_values(dbutils)
+        resolved_context = context or resolve_databricks_context(
+            dbutils=dbutils,
+            spark=spark,
+            fallback=_context_from_widgets(widget_values),
+        )
         resolved_sink = sink
         if resolved_sink is None and spark is not None and event_table:
             resolved_sink = DeltaSink(spark=spark, table_name=event_table)

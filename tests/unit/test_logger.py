@@ -240,6 +240,37 @@ def test_observe_notebook_from_widgets_uses_optional_context_widgets():
     assert sink.events[-1].task_run_id == "task-run-1"
 
 
+def test_observe_notebook_direct_uses_optional_context_widgets():
+    """
+    What: Uses optional widget values when bootstrapping directly.
+    Why: Some notebooks pass app/table arguments directly but task context via parameters.
+    Fails when: Direct observe_notebook calls ignore task parameter widgets.
+    """
+    sink = MemorySink()
+    dbutils = FakeDbutils(
+        {
+            "task_key": "smoke_task",
+            "task_run_id": "task-run-1",
+            "task_attempt_number": "1",
+            "job_start_time": "2026-06-04T13:00:00Z",
+        }
+    )
+
+    logger = observe_notebook(
+        app_name="app",
+        component="component",
+        environment="dev",
+        sink=sink,
+        dbutils=dbutils,
+    )
+
+    assert logger.context.task_key == "smoke_task"
+    assert logger.context.task_run_id == "task-run-1"
+    assert logger.context.task_attempt_number == "1"
+    assert logger.context.job_start_time == "2026-06-04T13:00:00Z"
+    assert sink.events[-1].task_key == "smoke_task"
+
+
 def test_get_default_logger_requires_bootstrap():
     """
     What: Raises a clear configuration error when no default logger exists.
