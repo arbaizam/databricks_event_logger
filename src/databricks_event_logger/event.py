@@ -20,6 +20,11 @@ from databricks_event_logger.serialization import serialize_metadata
 from databricks_event_logger.timing import utc_now
 from databricks_event_logger.version import __version__
 
+VALID_STATUSES = frozenset({"started", "success", "failed", "warning", "skipped"})
+VALID_SEVERITIES = frozenset({"debug", "info", "warning", "error", "critical"})
+MAX_EVENT_NAME_CHARS = 255
+MAX_EVENT_TYPE_CHARS = 100
+
 
 @dataclass(init=False)
 class EventRecord:
@@ -140,6 +145,24 @@ class EventRecord:
         """
         Create an event record.
         """
+        _validate_required_text(
+            event_name,
+            field_name="event_name",
+            max_chars=MAX_EVENT_NAME_CHARS,
+        )
+        _validate_required_text(
+            event_type,
+            field_name="event_type",
+            max_chars=MAX_EVENT_TYPE_CHARS,
+        )
+        _validate_choice(status, field_name="status", valid_values=VALID_STATUSES)
+        if severity is not None:
+            _validate_choice(
+                severity,
+                field_name="severity",
+                valid_values=VALID_SEVERITIES,
+            )
+
         # Keep defaulting here so metadata serialization and runtime context
         # flattening remain explicit and happen exactly once per event.
         resolved_event_ts = event_ts or utc_now()
@@ -221,3 +244,27 @@ class EventRecord:
             else:
                 output[key] = value
         return output
+
+
+def _validate_required_text(value: str, *, field_name: str, max_chars: int) -> None:
+    """
+    Validate one required short text field.
+    """
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{field_name} must be a non-empty string.")
+    if len(value) > max_chars:
+        raise ValueError(f"{field_name} must be {max_chars} characters or fewer.")
+
+
+def _validate_choice(
+    value: str,
+    *,
+    field_name: str,
+    valid_values: frozenset[str],
+) -> None:
+    """
+    Validate one enum-like event field.
+    """
+    if value not in valid_values:
+        valid_text = ", ".join(sorted(valid_values))
+        raise ValueError(f"{field_name} must be one of: {valid_text}.")

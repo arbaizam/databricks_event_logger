@@ -146,6 +146,44 @@ def test_context_resolver_uses_dbutils_tags_when_json_is_unavailable():
     assert context.notebook_path == "/Workspace/smoke"
 
 
+def test_context_resolver_explicit_fallback_overrides_dbutils_context():
+    """
+    What: Lets widget/task-parameter values override heuristic dbutils context.
+    Why: Databricks dynamic task parameters are the stable job contract.
+    Fails when: dbutils context replaces explicit run/task identifiers.
+    """
+    dbutils = FakeDbutils(
+        FakeNotebookContext(
+            json_payload={
+                "currentRunId": {"id": "auto-job-run"},
+                "tags": {
+                    "taskKey": "auto_task",
+                    "taskRunId": "auto-task-run",
+                    "taskAttemptNumber": "9",
+                    "browserHostName": "auto.cloud.databricks.com",
+                },
+            }
+        )
+    )
+
+    context = resolve_databricks_context(
+        dbutils=dbutils,
+        fallback={
+            "run_id": "widget-job-run",
+            "task_key": "widget_task",
+            "task_run_id": "widget-task-run",
+            "task_attempt_number": "1",
+            "workspace_url": "widgets.cloud.databricks.com",
+        },
+    )
+
+    assert context.run_id == "widget-job-run"
+    assert context.task_key == "widget_task"
+    assert context.task_run_id == "widget-task-run"
+    assert context.task_attempt_number == "1"
+    assert context.workspace_url == "widgets.cloud.databricks.com"
+
+
 class FakeDbutils:
     def __init__(self, context):
         self.notebook = FakeNotebook(context)

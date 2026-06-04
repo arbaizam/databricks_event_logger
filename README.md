@@ -35,10 +35,14 @@ The v1 design background is in
 - [Quickstart](#quickstart)
 - [How Sink Selection Works](#how-sink-selection-works)
 - [Public API](#public-api)
+- [Production Controls](#production-controls)
+- [Spark Helper API](#spark-helper-api)
 - [Notebook Patterns](#notebook-patterns)
 - [Job And Task Patterns](#job-and-task-patterns)
+- [Package-Level Decorator Pattern](#package-level-decorator-pattern)
 - [Rules Engine Integration Pattern](#rules-engine-integration-pattern)
 - [Metrics, Row Counts, And Spark Laziness](#metrics-row-counts-and-spark-laziness)
+- [Historical AsOfDate Reload Pattern](#historical-asofdate-reload-pattern)
 - [Conditional Severity](#conditional-severity)
 - [Parent And Correlation IDs](#parent-and-correlation-ids)
 - [Failure Behavior](#failure-behavior)
@@ -117,6 +121,12 @@ The package provides:
 - `EventLogger.run_task(...)`: task/main wrapper.
 - `EventLogger.record_event(...)`: explicit event logging.
 - `EventLogger.record_metric(...)`: explicit metric logging.
+- `databricks_event_logger.spark.read_table(...)`: logged Spark table read helper.
+- `databricks_event_logger.spark.write_delta(...)`: logged Delta write helper.
+- `databricks_event_logger.spark.run_sql(...)`: logged Spark SQL helper.
+- `databricks_event_logger.spark.validate_row_count(...)`: logged row-count validation.
+- `databricks_event_logger.spark.count_rows(...)`: explicit logged Spark count helper.
+- `databricks_event_logger.spark.table_exists(...)`: logged table-existence smoke check.
 - `MemorySink`: in-memory events for tests and dry runs.
 - `ConsoleSink`: JSON-line event output for debugging.
 - `DeltaSink`: immediate Delta writes for Databricks persistence.
@@ -165,6 +175,8 @@ Create the event table before using `DeltaSink`.
 
 The template DDL lives in
 [resources/sql/create_event_log.sql](resources/sql/create_event_log.sql).
+Optional dashboard view templates live in
+[resources/sql/create_event_log_views.sql](resources/sql/create_event_log_views.sql).
 
 Replace `${observability_event_table}` with your fully qualified table name, for
 example:
@@ -182,8 +194,8 @@ catalog.schema.table
 
 Names requiring backticks or other special characters are intentionally rejected
 because the target table identifier is used in SQL `INSERT` statements. Use
-plain UC object names such as `observability.event_log` under a plain catalog and
-schema.
+plain three-part UC object names such as
+`dev_observability.observability.event_log`.
 
 The table columns are:
 
@@ -271,6 +283,10 @@ They are not directly evaluated inside notebook code. Databricks documents the
 supported values here:
 [Databricks dynamic value references](https://docs.databricks.com/aws/en/jobs/dynamic-value-references).
 
+When both widgets/task parameters and heuristic runtime context are available,
+the explicit widget/task-parameter values win. This keeps the job contract
+stable across Databricks runtime modes.
+
 `task_attempt_number` is stored as a string in the event table for consistency
 with other Databricks context fields. Cast it when you need numeric comparisons:
 
@@ -357,14 +373,24 @@ event_logger.record_event(
 )
 ```
 
-Query the event table:
+Inspect the emitted events. When the sink is `DeltaSink`, query the event table.
+When the sink is `MemorySink`, inspect the in-memory events for this Python
+process:
 
 ```python
-display(
-    spark.table(dbutils.widgets.get("observability_event_table"))
-    .where("event_name in ('notebook.started', 'example.checkpoint')")
-    .orderBy("event_ts", ascending=False)
-)
+if type(event_logger.sink).__name__ == "DeltaSink":
+    display(
+        spark.table(dbutils.widgets.get("observability_event_table"))
+        .where("event_name in ('notebook.started', 'example.checkpoint')")
+        .orderBy("event_ts", ascending=False)
+    )
+else:
+    display(
+        spark.createDataFrame(
+            [(event.event_name, event.status) for event in event_logger.sink.events],
+            ["event_name", "status"],
+        )
+    )
 ```
 
 ## How Sink Selection Works
@@ -418,6 +444,59 @@ looks misconfigured:
 
 - `observability_event_table` is present but no `spark` session was supplied.
 - `spark` is present but `observability_event_table` is missing or blank.
+
+## Production Controls
+
+Development notebooks can rely on the default best-effort behavior. Production
+jobs should usually opt into stricter bootstrap checks:
+
+```python
+event_logger = observe_notebook.from_widgets(
+    dbutils=dbutils,
+    spark=spark,
+    require_persistence=True,
+    validate_sink=True,
+    strict_logging=True,
+    default_metadata={
+        "workflow": "daily_positions",
+        "owner": "finance_data",
+    },
+)
+```
+
+`require_persistence=True` raises during bootstrap unless the resolved sink is a
+`DeltaSink`. This prevents a misconfigured job from silently using `MemorySink`.
+
+`validate_sink=True` calls `DeltaSink.validate()` before `notebook.started` is
+emitted. Validation checks that the table can be described and that the required
+event columns exist.
+
+`strict_logging=True` raises sink errors for successful business paths. Failure
+logging still preserves the original business exception, so a broken sink cannot
+hide the exception that should fail the Databricks task.
+
+Metadata and error payloads are bounded by default:
+
+```python
+event_logger = observe_notebook.from_widgets(
+    dbutils=dbutils,
+    spark=spark,
+    metadata_max_bytes=4000,
+    metadata_string_max_chars=2000,
+    error_message_max_chars=2000,
+    max_events_warning_threshold=100,
+)
+```
+
+Sensitive-looking metadata keys such as `password`, `token`, `secret`,
+`credential`, `api_key`, `access_key`, and `private_key` are redacted. This is a
+safety net, not a substitute for keeping credentials and row-level records out of
+event metadata.
+
+The startup event `notebook.started` also includes bootstrap diagnostics in
+`metadata_json`, including `sink_type`, `event_table`, `require_persistence`,
+`validate_sink`, `strict_logging`, `job_url`, and `job_run_url`. That makes the
+first event in a run useful for debugging configuration and quick navigation.
 
 ## Public API
 
@@ -594,6 +673,117 @@ passing `metric_name` and `metric_value` to `record_event(...)`.
 Decorator and context manager events normally have `metric_name` and
 `metric_value` as `NULL`.
 
+## Spark Helper API
+
+For common notebook operations, prefer the helper API over hand-written context
+manager blocks. The helpers keep call sites short while still logging
+success/failure, timing, source/target tables, and relevant metadata.
+
+```python
+from databricks_event_logger.spark import (
+    count_rows,
+    read_table,
+    run_sql,
+    table_exists,
+    validate_row_count,
+    write_delta,
+)
+```
+
+### `read_table(...)`
+
+```python
+source_df = read_table(
+    "catalog.schema.source",
+    as_of_date="2026-06-30",
+)
+```
+
+This emits `event_name="delta.read"` and returns `spark.table(...)`. Spark reads
+are usually lazy, so this event means the DataFrame was requested. It does not
+prove rows were materialized.
+
+### `write_delta(...)`
+
+```python
+write_delta(
+    output_df,
+    table="catalog.schema.output",
+    mode="overwrite",
+    row_count=known_output_rows,
+    overwrite_schema=True,
+    replace_where="AsOfDate = DATE '2026-06-30'",
+    as_of_date="2026-06-30",
+)
+```
+
+This wraps `df.write.format("delta").mode(mode).saveAsTable(table_name)` and
+emits `event_name="delta.write"`. The helper does not call `count()`; pass
+`row_count` only when the workflow already has it.
+
+### `run_sql(...)`
+
+```python
+run_sql(
+    "OPTIMIZE catalog.schema.output",
+    maintenance_action="optimize",
+)
+```
+
+The helper logs a SHA-256 hash of the SQL text by default. It does not store a
+SQL preview unless you explicitly opt in:
+
+```python
+run_sql(
+    "OPTIMIZE catalog.schema.output",
+    include_sql_preview=True,
+    maintenance_action="optimize",
+)
+```
+
+When preview is enabled, quoted strings and obvious numeric literals are
+redacted before the preview is truncated. Do not enable SQL previews for
+statements that may contain sensitive predicates, tokens, account identifiers,
+customer identifiers, or row-level values.
+
+### `validate_row_count(...)`
+
+```python
+output_rows = validate_row_count(
+    table="catalog.schema.output",
+    expected_min=1,
+    validation_name="output_not_empty",
+)
+```
+
+This helper intentionally materializes a Spark action by calling `count()`. It
+logs `status="success"` with the observed row count, or logs
+`status="failed"` and re-raises when the count does not satisfy the expectation.
+
+### `count_rows(...)`
+
+```python
+output_rows = count_rows(
+    output_df,
+    table_name="catalog.schema.output",
+    metric_context="post_transform",
+)
+```
+
+This helper intentionally performs `DataFrame.count()` and logs the resulting
+row count. It is useful for explicit metrics and smoke checks, but should not be
+called automatically inside read/write helpers.
+
+### `table_exists(...)`
+
+```python
+if not table_exists(table="catalog.schema.source", check_context="startup"):
+    raise RuntimeError("Required source table is missing.")
+```
+
+This helper uses Spark catalog metadata and logs a validation event with
+`status="success"` when the table exists or `status="warning"` when it does not.
+
 ## Notebook Patterns
 
 ### Minimal Notebook
@@ -613,6 +803,7 @@ event_logger.record_event(
 
 ```python
 from databricks_event_logger import observe_notebook
+from databricks_event_logger.spark import read_table, write_delta
 
 event_logger = observe_notebook.from_widgets(dbutils=dbutils, spark=spark)
 
@@ -621,19 +812,8 @@ def main():
     source_table = "catalog.schema.source"
     target_table = "catalog.schema.target"
 
-    with event_logger.event(
-        "example.read_source",
-        event_type="delta_read",
-        source_table=source_table,
-    ):
-        source_df = spark.table(source_table)
-
-    with event_logger.event(
-        "example.write_target",
-        event_type="delta_write",
-        target_table=target_table,
-    ):
-        source_df.write.mode("overwrite").saveAsTable(target_table)
+    source_df = read_table(source_table)
+    write_delta(source_df, target_table, mode="overwrite")
 
 
 event_logger.run_task("example.task", main)
@@ -688,6 +868,7 @@ print(f"job_id: {event_logger.context.job_id}")
 print(f"run_id: {event_logger.context.run_id}")
 print(f"task_key: {event_logger.context.task_key}")
 print(f"task_run_id: {event_logger.context.task_run_id}")
+print(f"job_run_url: {event_logger.job_run_url}")
 ```
 
 ### Task Wrapper Pattern
@@ -708,6 +889,54 @@ event_logger.run_task(
 
 If `main()` raises, the package emits a failed event and re-raises the original
 exception so the Databricks task still fails normally.
+
+## Package-Level Decorator Pattern
+
+For pre-existing packages, keep the package implementation unchanged and wrap
+the public method at the notebook or application boundary. This is usually the
+lowest-friction production pattern because it avoids new package dependencies
+and still gives dashboards a stable event around the business operation.
+
+```python
+from databricks_event_logger import observed
+
+
+def evaluate_dataframe_with_logging(
+    service,
+    input_df,
+    *,
+    ruleset_name: str,
+    version: str | None,
+    column_prefix: str,
+    fail_on_error: bool,
+):
+    metadata = {
+        "ruleset_name": ruleset_name,
+        "version": version,
+        "column_prefix": column_prefix,
+        "fail_on_error": fail_on_error,
+    }
+
+    @observed(
+        "rules_engine.evaluate_dataframe",
+        event_type="rules_engine",
+        metadata=metadata,
+    )
+    def _evaluate():
+        return service.evaluate_dataframe(
+            input_df,
+            ruleset_name=ruleset_name,
+            version=version,
+            column_prefix=column_prefix,
+            fail_on_error=fail_on_error,
+        )
+
+    return _evaluate()
+```
+
+Define the decorated inner function after runtime values are known. Avoid module
+import-time decorators when metadata depends on notebook widgets, task
+parameters, `AsOfDate`, ruleset versions, or other runtime values.
 
 ## Rules Engine Integration Pattern
 
@@ -755,33 +984,32 @@ mean Spark has evaluated every row yet.
 Log the materialization separately:
 
 ```python
+from databricks_event_logger.spark import write_delta
+
 target_table = "catalog.schema.rules_output"
 
-with event_logger.event(
-    "rules_engine.evaluate_dataframe.materialized",
-    event_type="rules_engine",
-    target_table=target_table,
-    metadata={
-        "ruleset_name": ruleset_name,
-        "version": ruleset_version,
-        "materialization": "saveAsTable",
-    },
-):
-    evaluated_df.write.mode("overwrite").saveAsTable(target_table)
+write_delta(
+    evaluated_df,
+    table=target_table,
+    mode="overwrite",
+    ruleset_name=ruleset_name,
+    version=ruleset_version,
+    materialization="saveAsTable",
+)
 ```
 
 Log metrics separately:
 
 ```python
-with event_logger.event(
-    "rules_engine.evaluate_dataframe.counted",
-    event_type="rules_engine",
-    metadata={
-        "ruleset_name": ruleset_name,
-        "version": ruleset_version,
-    },
-):
-    output_rows = evaluated_df.count()
+from databricks_event_logger.spark import count_rows
+
+output_rows = count_rows(
+    evaluated_df,
+    event_name="rules_engine.evaluate_dataframe.counted",
+    table_name=target_table,
+    ruleset_name=ruleset_name,
+    version=ruleset_version,
+)
 
 event_logger.record_metric(
     "rules_engine_output_rows",
@@ -800,12 +1028,14 @@ column:
 ```python
 error_column = f"{column_prefix}_error"
 
-with event_logger.event(
-    "rules_engine.row_errors.counted",
-    event_type="rules_engine_quality",
-    metadata={"ruleset_name": ruleset_name, "version": ruleset_version},
-):
-    error_count = evaluated_df.where(f"{error_column} is not null").count()
+error_count = count_rows(
+    evaluated_df.where(f"{error_column} is not null"),
+    event_name="rules_engine.row_errors.counted",
+    table_name=target_table,
+    ruleset_name=ruleset_name,
+    version=ruleset_version,
+    error_column=error_column,
+)
 
 event_logger.record_event(
     "rules_engine.row_errors_checked",
@@ -873,6 +1103,58 @@ Use `record_metric(...)` when the value should be treated as a metric:
 ```python
 event_logger.record_metric("output_rows", float(output_rows))
 ```
+
+## Historical AsOfDate Reload Pattern
+
+When an upstream IT-owned table can be reloaded historically, do not rely only
+on the latest table-update trigger timestamp. Track which business dates changed
+since the last processed watermark, log all affected dates, and then decide
+which dates the current workflow will process.
+
+Recommended workflow-owned control table fields:
+
+- `source_table`
+- `business_key_hash`
+- `as_of_date`
+- `last_seen_mod_ts`
+- `last_seen_deleted_flag`
+- `last_detected_at`
+
+High-level flow:
+
+```python
+from databricks_event_logger.spark import read_table
+
+source_table = "catalog.schema.it_owned_source"
+source_df = read_table(source_table)
+
+changed_dates_df = (
+    source_df
+    .where("M_ModDate > '<last successful watermark>'")
+    .selectExpr("CAST(AsOfDate AS DATE) AS as_of_date")
+    .distinct()
+)
+
+changed_dates = [row.as_of_date.isoformat() for row in changed_dates_df.collect()]
+
+for as_of_date in changed_dates:
+    event_logger.record_event(
+        "source_table.as_of_date_changed",
+        event_type="source_table_change",
+        status="success",
+        severity="info",
+        source_table=source_table,
+        metadata={
+            "as_of_date": as_of_date,
+            "change_detection": "M_ModDate watermark",
+        },
+    )
+```
+
+For v1, log every changed `AsOfDate` but process only the latest date if that is
+the current business requirement. If deletes matter, include delete indicators
+or anti-join detection in the control-table comparison so historical deletes
+also emit `source_table.as_of_date_changed`.
 
 ## Conditional Severity
 
@@ -949,6 +1231,11 @@ warning and lets business code continue.
 If business code fails and failure logging also fails, the package warns and
 re-raises the original business exception.
 
+When `strict_logging=True`, sink failures can fail an otherwise successful
+business path. Use this only when event persistence is itself a production
+control. Even in strict mode, failure-event logging does not replace the original
+business exception.
+
 ## Metadata Guidance
 
 Metadata is caller-controlled JSON.
@@ -994,9 +1281,26 @@ Avoid metadata that contains:
 
 The serializer handles common non-JSON objects such as dates, datetimes,
 Decimals, enums, Paths, dataclasses, and sets. It does not enforce a key
-allowlist or hard size limit in v1.
+allowlist, but it does apply production-safe hygiene by default:
+
+- redacts sensitive-looking keys such as `password`, `token`, `secret`,
+  `credential`, `api_key`, `access_key`, and `private_key`
+- truncates long string values
+- replaces oversized serialized metadata with a bounded preview payload
+
+Tune these defaults with `metadata_max_bytes`, `metadata_string_max_chars`, and
+`redact_keys` when creating the logger.
 
 ## Querying The Event Table
+
+The optional view template
+[resources/sql/create_event_log_views.sql](resources/sql/create_event_log_views.sql)
+adds three dashboard-friendly views:
+
+- recent events with `job_url` and `job_run_url`
+- failure-first events with direct job-run navigation
+- run summaries with event counts, failure counts, warning counts, and first/last
+  event timestamps
 
 ### Recent Events
 
@@ -1097,6 +1401,30 @@ display(
 )
 ```
 
+### Current Run Enrichment
+
+Databricks system tables remain authoritative for job/task run state. Build
+views that join this event table to system tables in your workspace after
+validating the available system-table schema and column names.
+
+Example shape:
+
+```sql
+CREATE OR REPLACE VIEW catalog.schema.event_log_with_run_context AS
+SELECT
+  e.*,
+  r.run_name,
+  r.result_state,
+  r.trigger_type AS system_trigger_type
+FROM catalog.schema.event_log AS e
+LEFT JOIN system.lakeflow.job_run_timeline AS r
+  ON e.run_id = CAST(r.run_id AS STRING);
+```
+
+Treat this as a workspace-owned dashboard/view pattern, not package-owned DDL.
+If your workspace exposes different system table names or columns, adjust the
+view outside the package.
+
 ## Troubleshooting
 
 ### Events Are Not In Delta
@@ -1194,9 +1522,9 @@ Local syntax/unit checks can still run when the environment has the required
 tools:
 
 ```powershell
-python -m pytest tests/unit
+$env:PYTHONPATH='src'; python -m pytest tests/unit
 python -m ruff check . --no-cache
-python -m build --wheel --no-isolation
+python -m build --wheel
 ```
 
 Databricks smoke tests should verify:

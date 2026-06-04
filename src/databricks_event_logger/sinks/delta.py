@@ -10,6 +10,7 @@ interface if event volume makes small writes too expensive.
 from __future__ import annotations
 
 import re
+import warnings
 from dataclasses import dataclass
 from typing import Any
 from uuid import uuid4
@@ -114,6 +115,7 @@ class DeltaSink:
         dataframe = self.spark.createDataFrame([row], schema=_event_schema())
         dataframe.createOrReplaceTempView(view_name)
 
+        insert_error: Exception | None = None
         try:
             self.spark.sql(
                 f"""
@@ -122,8 +124,53 @@ class DeltaSink:
                 FROM {view_name}
                 """
             )
+        except Exception as exc:
+            insert_error = exc
+            raise
         finally:
-            self.spark.sql(f"DROP VIEW IF EXISTS {view_name}")
+            try:
+                self.spark.sql(f"DROP VIEW IF EXISTS {view_name}")
+            except Exception as cleanup_exc:
+                if insert_error is None:
+                    raise
+                warnings.warn(
+                    "DeltaSink failed to clean up staging view after an insert "
+                    f"failure; preserving the original insert error: {cleanup_exc}",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+
+    def validate(self) -> None:
+        """
+        Validate that the configured event table is queryable and has v1 columns.
+
+        Raises
+        ------
+        EventLoggerConfigurationError
+            If the table cannot be described or required event columns are
+            missing.
+        """
+        try:
+            describe_result = self.spark.sql(f"DESCRIBE TABLE {self.table_name}")
+        except Exception as exc:
+            raise EventLoggerConfigurationError(
+                f"DeltaSink could not describe event table {self.table_name!r}: {exc}"
+            ) from exc
+        rows = _collect_optional(describe_result)
+        if rows is None:
+            return
+        described_columns = {
+            column_name
+            for row in rows
+            if (column_name := _row_value(row, "col_name"))
+            and not str(column_name).startswith("#")
+        }
+        missing_columns = sorted(set(EVENT_COLUMNS) - set(described_columns))
+        if missing_columns:
+            raise EventLoggerConfigurationError(
+                f"DeltaSink event table {self.table_name!r} is missing required "
+                f"columns: {', '.join(missing_columns)}"
+            )
 
     def flush(self) -> None:
         """
@@ -212,3 +259,24 @@ def _event_schema() -> Any:
             StructField("created_at", TimestampType(), nullable=False),
         ]
     )
+
+
+def _collect_optional(result: Any) -> list[Any] | None:
+    """
+    Collect a Spark result when the test double or Spark object supports it.
+    """
+    collect = getattr(result, "collect", None)
+    if collect is None:
+        return None
+    return list(collect())
+
+
+def _row_value(row: Any, name: str) -> str | None:
+    """
+    Read one named value from a Spark Row-like object.
+    """
+    if hasattr(row, "asDict"):
+        return row.asDict().get(name)
+    if isinstance(row, dict):
+        return row.get(name)
+    return getattr(row, name, None)

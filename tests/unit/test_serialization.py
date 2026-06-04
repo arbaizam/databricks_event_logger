@@ -40,3 +40,46 @@ def test_serialize_metadata_returns_none_for_empty_metadata():
     """
     assert serialize_metadata(None) is None
     assert serialize_metadata({}) is None
+
+
+def test_serialize_metadata_redacts_and_truncates_nested_values():
+    """
+    What: Applies redaction and string truncation before metadata persistence.
+    Why: Production event rows should not accidentally store common secrets or huge strings.
+    Fails when: Sensitive-looking keys or oversized strings leak into metadata JSON.
+    """
+    metadata_json = serialize_metadata(
+        {
+            "api_token": "secret-value",
+            "nested": {
+                "private_key": "abc",
+                "message": "abcdef",
+            },
+        },
+        string_max_chars=3,
+        max_bytes=None,
+    )
+
+    metadata = deserialize_metadata(metadata_json)
+
+    assert metadata["api_token"] == "[REDACTED]"
+    assert metadata["nested"]["private_key"] == "[REDACTED]"
+    assert metadata["nested"]["message"] == "abc...[TRUNCATED]"
+
+
+def test_serialize_metadata_caps_oversized_payloads():
+    """
+    What: Replaces oversized serialized metadata with a bounded preview payload.
+    Why: A single noisy event should not create unbounded Delta JSON payloads.
+    Fails when: Metadata size limits are ignored.
+    """
+    metadata_json = serialize_metadata(
+        {"message": "x" * 500},
+        string_max_chars=None,
+        max_bytes=180,
+    )
+    metadata = deserialize_metadata(metadata_json)
+
+    assert metadata["_truncated"] is True
+    assert metadata["_original_size_bytes"] > 180
+    assert len(metadata_json.encode("utf-8")) <= 180

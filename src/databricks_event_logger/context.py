@@ -129,18 +129,21 @@ def resolve_databricks_context(
         Optional Spark session. When supplied, selected Spark configuration
         values may be used as fallbacks.
     fallback : Mapping[str, Any] | None, default None
-        Explicit fallback values. These are useful in tests and for code paths
-        where a caller already resolved context externally.
+        Explicit caller-supplied values. These are useful in tests and for code
+        paths where a caller already resolved context externally. They override
+        heuristic runtime detection so widget/task-parameter values can remain
+        authoritative in Databricks jobs.
 
     Returns
     -------
     RuntimeContext
         Best-effort context. Missing or inaccessible values are ``None``.
     """
-    values: dict[str, Any] = dict(fallback or {})
+    values: dict[str, Any] = {}
     values.update(_context_from_environment())
     values.update(_context_from_spark(spark))
     values.update(_context_from_dbutils(dbutils))
+    values.update(dict(fallback or {}))
     return RuntimeContext.from_mapping(values)
 
 

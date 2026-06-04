@@ -1,9 +1,12 @@
+import warnings
 from contextvars import Context
 
 import pytest
 
 from databricks_event_logger import EventLogger, get_default_logger, observe_notebook, observed
+from databricks_event_logger.context import RuntimeContext
 from databricks_event_logger.errors import EventLoggerConfigurationError
+from databricks_event_logger.serialization import deserialize_metadata
 from databricks_event_logger.sinks.memory import MemorySink
 
 
@@ -409,6 +412,22 @@ def test_logging_failure_warns_and_preserves_success_return_value():
         assert work() == "ok"
 
 
+def test_strict_logging_raises_sink_failure_on_success_path():
+    """
+    What: Raises sink errors when strict logging is explicitly enabled.
+    Why: Production controls may require event persistence to be mandatory.
+    Fails when: strict_logging=True still silently warns and continues.
+    """
+    logger = EventLogger(sink=FailingSink(), strict_logging=True)
+
+    @logger.logged_event("reporting.success")
+    def work():
+        return "ok"
+
+    with pytest.raises(RuntimeError, match="sink unavailable"):
+        work()
+
+
 def test_failure_logging_failure_preserves_original_exception():
     """
     What: Re-raises the business exception when failure-event emission fails.
@@ -424,6 +443,108 @@ def test_failure_logging_failure_preserves_original_exception():
     with pytest.warns(RuntimeWarning, match="Failed to emit event"):
         with pytest.raises(ValueError, match="business failure"):
             fail()
+
+
+def test_default_metadata_merges_with_event_metadata():
+    """
+    What: Applies logger-level default metadata to emitted events.
+    Why: Production jobs need run-level metadata without repeating it at every call site.
+    Fails when: default_metadata is dropped or overrides event-level metadata.
+    """
+    sink = MemorySink()
+    logger = EventLogger(
+        sink=sink,
+        default_metadata={"workflow": "daily_positions", "stage": "default"},
+    )
+
+    event = logger.record_event("reporting.step", metadata={"stage": "custom"})
+    metadata = deserialize_metadata(event.metadata_json)
+
+    assert metadata == {"stage": "custom", "workflow": "daily_positions"}
+
+
+def test_logger_builds_job_navigation_urls_from_context():
+    """
+    What: Derives Databricks job and run UI links from runtime context.
+    Why: Dashboards and notebooks should offer one-click navigation to the run.
+    Fails when: URL derivation drops workspace, job, or run identifiers.
+    """
+    logger = EventLogger(
+        sink=MemorySink(),
+        context=RuntimeContext(
+            workspace_url="Example.Cloud.Databricks.com/",
+            job_id="123",
+            run_id="456",
+        ),
+    )
+
+    assert logger.job_url == "https://example.cloud.databricks.com/jobs/123"
+    assert logger.job_run_url == "https://example.cloud.databricks.com/jobs/123/runs/456"
+
+
+def test_observe_notebook_started_event_includes_bootstrap_diagnostics():
+    """
+    What: Adds sink and navigation diagnostics to the startup event metadata.
+    Why: Misconfiguration should be visible from the first event in a run.
+    Fails when: notebook.started omits production bootstrap details.
+    """
+    sink = MemorySink()
+    context = RuntimeContext(
+        workspace_url="workspace.cloud.databricks.com",
+        job_id="123",
+        run_id="456",
+    )
+
+    logger = observe_notebook(
+        app_name="app",
+        component="component",
+        environment="dev",
+        sink=sink,
+        context=context,
+        require_persistence=False,
+        validate_sink=True,
+        strict_logging=True,
+    )
+    metadata = deserialize_metadata(sink.events[-1].metadata_json)
+
+    assert logger is get_default_logger()
+    assert metadata["sink_type"] == "MemorySink"
+    assert metadata["validate_sink"] is True
+    assert metadata["strict_logging"] is True
+    assert metadata["job_run_url"] == "https://workspace.cloud.databricks.com/jobs/123/runs/456"
+
+
+def test_event_volume_warning_emits_once():
+    """
+    What: Warns once when a logger emits more events than the configured threshold.
+    Why: Immediate Delta writes should discourage unexpectedly chatty instrumentation.
+    Fails when: High-volume event loops stay invisible to developers.
+    """
+    logger = EventLogger(sink=MemorySink(), max_events_warning_threshold=1)
+
+    logger.record_event("reporting.first")
+    with pytest.warns(RuntimeWarning, match="more than 1 events"):
+        logger.record_event("reporting.second")
+    with warnings.catch_warnings(record=True) as warning_records:
+        warnings.simplefilter("always")
+        logger.record_event("reporting.third")
+
+    assert not warning_records
+
+
+def test_observe_notebook_requires_persistence_when_requested():
+    """
+    What: Fails bootstrap when production persistence is required but unavailable.
+    Why: Production jobs should not silently fall back to MemorySink.
+    Fails when: require_persistence=True still allows in-memory events.
+    """
+    with pytest.raises(EventLoggerConfigurationError, match="Persistent event logging"):
+        observe_notebook(
+            app_name="app",
+            component="component",
+            environment="dev",
+            require_persistence=True,
+        )
 
 
 class FakeDbutils:

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "databricks-event-logger"
-version = "0.1.2"
+version = "0.1.3"
 description = "Structured event logging helpers for Databricks workloads."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -38,3 +38,6 @@ src = ["src", "tests"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B"]
+
+[tool.ruff.lint.per-file-ignores]
+"notebooks/*.py" = ["B018", "E402", "F821"]

@@ -110,7 +110,7 @@ Sinks
   - DeltaSink for Databricks persistence
 
 Delta Observability Table
-  - observability.event_log
+  - dev_observability.observability.event_log
   - Append-only event records
 
 Dashboard Views
@@ -270,6 +270,8 @@ from databricks_event_logger.spark import (
     write_delta,
     run_sql,
     validate_row_count,
+    count_rows,
+    table_exists,
 )
 ```
 
@@ -412,9 +414,9 @@ from databricks_event_logger import observe_notebook
 
 
 def main():
-    positions = read_table("bronze.co_positions")
+    positions = read_table("catalog.bronze.co_positions")
     mapped = apply_rules(positions, ruleset="MVE_DOE_POSITION_MAPPING")
-    write_delta(mapped, table="silver.positions_daily", mode="overwrite")
+    write_delta(mapped, "catalog.silver.positions_daily", mode="overwrite")
 
 
 logger = observe_notebook.from_widgets()
@@ -455,7 +457,7 @@ Spark helpers are intended to make standard operations observable without extra 
 from databricks_event_logger.spark import read_table
 
 positions = read_table(
-    "bronze.co_positions",
+    "catalog.bronze.co_positions",
     as_of_date=as_of_date,
 )
 ```
@@ -466,7 +468,7 @@ Expected event:
 event_name: delta.read
 event_type: delta_read
 status: success or failed
-source_table: bronze.co_positions
+source_table: catalog.bronze.co_positions
 duration_ms: captured
 metadata_json: includes as_of_date
 ```
@@ -477,10 +479,11 @@ metadata_json: includes as_of_date
 from databricks_event_logger.spark import write_delta
 
 write_delta(
-    df=mapped_positions,
-    table="silver.positions_daily",
+    mapped_positions,
+    table="catalog.silver.positions_daily",
     mode="overwrite",
     overwrite_schema=True,
+    replace_where=f"AsOfDate = DATE '{as_of_date}'",
     as_of_date=as_of_date,
     row_count=known_row_count,
 )
@@ -492,20 +495,20 @@ Expected event:
 event_name: delta.write
 event_type: delta_write
 status: success or failed
-target_table: silver.positions_daily
+target_table: catalog.silver.positions_daily
 duration_ms: captured
 row_count: known_row_count if supplied
-metadata_json: includes mode, overwrite_schema, as_of_date
+metadata_json: includes mode, options, overwrite_schema, replace_where, as_of_date
 ```
 
-Row counts should not be computed automatically by default because `DataFrame.count()` introduces an extra Spark action. The helper may support `count_rows=True` for workflows that explicitly accept that cost.
+Row counts should not be computed automatically by default because `DataFrame.count()` introduces an extra Spark action. The helper accepts an explicit `row_count` when the workflow already knows it; use `validate_row_count(...)` when a materialized count is intentionally required.
 
 ### 7.3 SQL Execution
 
 ```python
 from databricks_event_logger.spark import run_sql
 
-run_sql("OPTIMIZE silver.positions_daily")
+run_sql("OPTIMIZE catalog.silver.positions_daily", maintenance_action="optimize")
 ```
 
 Expected event:
@@ -515,10 +518,16 @@ event_name: sql.execute
 event_type: sql
 status: success or failed
 duration_ms: captured
-metadata_json: includes sql_preview and optional sql_hash
+metadata_json: includes sql_hash; sql_preview only when explicitly enabled
 ```
 
-The SDK should log a short sanitized SQL preview, not full unrestricted SQL text by default.
+metadata_json includes `sql_hash` by default. `sql_preview` is opt-in through
+`include_sql_preview=True`.
+
+The SDK should not log SQL preview text by default. When preview is enabled, it
+should redact quoted strings and obvious numeric literals before truncation.
+Do not enable preview for SQL that may contain sensitive predicates, tokens,
+account identifiers, customer identifiers, or row-level values.
 
 ### 7.4 Validation
 
@@ -526,7 +535,7 @@ The SDK should log a short sanitized SQL preview, not full unrestricted SQL text
 from databricks_event_logger.spark import validate_row_count
 
 validate_row_count(
-    table="silver.positions_daily",
+    table="catalog.silver.positions_daily",
     expected_min=1,
     as_of_date=as_of_date,
 )
@@ -537,6 +546,39 @@ Expected behavior:
 - On pass, log a successful validation event.
 - On fail, log a failed validation event and raise a validation exception.
 - Include measured row count, expected threshold, table name, duration, and metadata.
+
+### 7.5 Explicit Count
+
+```python
+from databricks_event_logger.spark import count_rows
+
+row_count = count_rows(
+    mapped_positions,
+    table_name="catalog.silver.positions_daily",
+    as_of_date=as_of_date,
+)
+```
+
+Expected behavior:
+
+- Perform an explicit Spark `count()` action.
+- Log `event_name=spark.count`, `event_type=spark_action`, and `row_count`.
+- Re-raise any Spark exception after logging a failed event.
+
+### 7.6 Table Existence Check
+
+```python
+from databricks_event_logger.spark import table_exists
+
+if not table_exists(table="catalog.bronze.co_positions", check_context="startup"):
+    raise RuntimeError("Required source table is missing.")
+```
+
+Expected behavior:
+
+- Log success when the table exists.
+- Log warning and return `False` when the table is missing.
+- Log failure and re-raise when Spark catalog inspection itself fails.
 
 ## 8. Failure Handling
 
@@ -569,7 +611,7 @@ Version 1 behavior:
 EventLogger(...)
 ```
 
-`strict=True` means logging failures would be allowed to fail an otherwise successful business workflow. That is useful only when event logging is itself a required control. This project does not have that requirement for v1, so strict mode is out of scope unless added later.
+`strict_logging=True` means logging failures can fail an otherwise successful business workflow. That is useful only when event logging is itself a required control. V1 supports this as an explicit opt-in while keeping best-effort logging as the default.
 
 Required failure fields:
 
@@ -593,13 +635,13 @@ Required failure fields:
 Version 1 should use one append-only Delta table:
 
 ```text
-observability.event_log
+dev_observability.observability.event_log
 ```
 
 Recommended schema:
 
 ```sql
-CREATE TABLE IF NOT EXISTS observability.event_log (
+CREATE TABLE IF NOT EXISTS dev_observability.observability.event_log (
   event_name STRING NOT NULL,
   event_type STRING NOT NULL,
   status STRING NOT NULL,
@@ -935,9 +977,9 @@ Version 1 should include:
 - JSON serialization with deterministic fallback for non-serializable values.
 - Fully caller-configurable metadata.
 - No SDK-enforced metadata allowlist.
-- No SDK-enforced hard metadata size limit.
+- Default metadata hygiene for redaction, long string truncation, and bounded serialized payloads.
 
-Callers own the risk of very large metadata payloads. Large JSON values can increase Delta write cost, make dashboards harder to use, and make event records less useful for troubleshooting. Secrets, credentials, row-level data, and unrestricted sensitive payloads remain prohibited by usage standard, not by v1 SDK enforcement.
+Callers own metadata content and should keep payloads concise. Large JSON values can increase Delta write cost, make dashboards harder to use, and make event records less useful for troubleshooting. Secrets, credentials, row-level data, and unrestricted sensitive payloads remain prohibited by usage standard; SDK redaction/truncation is a safety net, not a data-governance substitute.
 
 ## 16. Sink Behavior
 
@@ -1095,6 +1137,8 @@ Build:
 - `write_delta`.
 - `run_sql`.
 - `validate_row_count`.
+- `count_rows`.
+- `table_exists`.
 - Mock-based tests.
 
 ### Phase 3: Delta Persistence
@@ -1158,13 +1202,13 @@ Explicit SDK-level completion means the notebook work is wrapped in a callable s
 
 ### Should the SDK automatically count DataFrame rows?
 
-No, not by default. Counting rows triggers a Spark action and can materially change job cost and runtime. Helpers should accept an explicit `row_count` or an opt-in `count_rows=True`.
+No, not by default. Counting rows triggers a Spark action and can materially change job cost and runtime. Helpers should accept an explicit `row_count` when the workflow already knows it. Use `validate_row_count(...)` when a workflow intentionally wants a counted validation event.
 
 ### What happens if logging fails?
 
 For v1, logging failures warn and continue when business code succeeds. If business code fails, the original business exception is always preserved and re-raised. The package will not fail a business workflow solely because event logging failed.
 
-`strict=True` would mean logging failure can fail an otherwise successful workflow. That is out of scope for v1.
+`strict_logging=True` means logging failure can fail an otherwise successful workflow. It is available in v1 for workflows where event persistence is a required control.
 
 ### Can packages use the SDK directly?
 
@@ -1180,7 +1224,7 @@ Yes. The SDK should expose `record_event` for explicit custom events, subject to
 
 ### How is SQL handled safely?
 
-Log a short sanitized preview and optional hash by default. Do not log full unrestricted SQL text unless a workflow has been reviewed for sensitive data exposure.
+Log a SQL hash by default. SQL preview is opt-in, redacted, and truncated. Do not enable SQL preview unless a workflow has been reviewed for sensitive data exposure.
 
 ### Where should the event table live?
 
@@ -1232,10 +1276,10 @@ These decisions were resolved during design review:
 - Unity Catalog catalog/schema/table location must be fully configurable through variables.
 - Table ownership, grants, read/write permissions, system-table permissions, and retention are handled outside the Python package.
 - Dev/test/prod event data should be separated through external configuration.
-- No workflow currently requires strict logging behavior. V1 should not fail business processing solely because logging failed.
+- Best-effort logging remains the default. Production workflows may opt into `strict_logging=True` when logging failure should fail an otherwise successful business path.
 - Metadata is fully caller-configurable.
 - No SDK-enforced metadata allowlist in v1.
-- No SDK-enforced hard metadata size limit in v1.
+- Metadata remains caller-configurable, with SDK defaults for redaction, truncation, and serialized payload bounds.
 - No formal naming review process is required for v1; use lightweight team conventions.
 - DeltaSink uses immediate writes in v1. Buffered writes are a future optimization.
 - Domain-specific event details are deferred to v2.

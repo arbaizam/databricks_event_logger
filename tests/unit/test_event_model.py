@@ -1,4 +1,4 @@
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from decimal import Decimal
 
 from databricks_event_logger.context import RuntimeContext
@@ -16,7 +16,7 @@ def test_event_record_serializes_metadata_and_context():
         "reporting.step",
         event_type="business_process",
         status="success",
-        event_ts=datetime(2026, 6, 3, 12, 0, tzinfo=UTC),
+        event_ts=datetime(2026, 6, 3, 12, 0, tzinfo=timezone.utc),
         app_name="app",
         component="component",
         environment="dev",
@@ -30,7 +30,10 @@ def test_event_record_serializes_metadata_and_context():
             job_trigger_type="one_time",
             run_as_user_name="svc@example.com",
         ),
-        metadata={"amount": Decimal("12.30"), "as_of_date": datetime(2026, 6, 3, tzinfo=UTC)},
+        metadata={
+            "amount": Decimal("12.30"),
+            "as_of_date": datetime(2026, 6, 3, tzinfo=timezone.utc),
+        },
     )
 
     row = event.as_dict()
@@ -58,10 +61,26 @@ def test_event_record_json_dict_renders_datetimes_as_text():
     """
     event = EventRecord(
         "reporting.step",
-        event_ts=datetime(2026, 6, 3, 12, 0, tzinfo=UTC),
+        event_ts=datetime(2026, 6, 3, 12, 0, tzinfo=timezone.utc),
     )
 
     row = event.as_json_dict()
 
     assert row["event_ts"] == "2026-06-03T12:00:00+00:00"
     assert row["event_date"] == "2026-06-03"
+
+
+def test_event_record_validates_core_fields():
+    """
+    What: Rejects invalid event identity and status fields.
+    Why: Dashboards depend on predictable event names, statuses, and severities.
+    Fails when: Invalid event rows can be constructed.
+    """
+    import pytest
+
+    with pytest.raises(ValueError, match="event_name"):
+        EventRecord("")
+    with pytest.raises(ValueError, match="status"):
+        EventRecord("reporting.step", status="done")
+    with pytest.raises(ValueError, match="severity"):
+        EventRecord("reporting.step", severity="urgent")

@@ -11,6 +11,7 @@
 # MAGIC - explicit events
 # MAGIC - decorators
 # MAGIC - context-manager logging
+# MAGIC - Spark helper logging
 # MAGIC - task-wrapper logging
 # MAGIC - metrics
 # MAGIC - conditional severity
@@ -65,6 +66,9 @@ dbutils.widgets.text("run_as_user_name", "")
 
 dbutils.widgets.dropdown("run_failure_demos", "false", ["false", "true"])
 dbutils.widgets.dropdown("run_rules_engine_demo", "false", ["false", "true"])
+dbutils.widgets.dropdown("require_persistence", "false", ["false", "true"])
+dbutils.widgets.dropdown("validate_sink", "false", ["false", "true"])
+dbutils.widgets.dropdown("strict_logging", "false", ["false", "true"])
 dbutils.widgets.text("demo_target_table", "")
 dbutils.widgets.text("rules_engine_schema", "")
 dbutils.widgets.text("ruleset_name", "")
@@ -87,10 +91,21 @@ dbutils.widgets.text("ruleset_version", "")
 # COMMAND ----------
 
 from databricks_event_logger import get_default_logger, observe_notebook, observed
+from databricks_event_logger.spark import count_rows, run_sql, validate_row_count, write_delta
+
+require_persistence = dbutils.widgets.get("require_persistence").strip().lower() == "true"
+validate_sink = dbutils.widgets.get("validate_sink").strip().lower() == "true"
+strict_logging = dbutils.widgets.get("strict_logging").strip().lower() == "true"
 
 event_logger = observe_notebook.from_widgets(
     dbutils=dbutils,
     spark=spark,
+    require_persistence=require_persistence,
+    validate_sink=validate_sink,
+    strict_logging=strict_logging,
+    default_metadata={
+        "guide": "databricks_event_logger_developer_guide",
+    },
 )
 
 print(f"sink: {type(event_logger.sink).__name__}")
@@ -104,6 +119,7 @@ print(f"run_id: {event_logger.context.run_id}")
 print(f"task_key: {event_logger.context.task_key}")
 print(f"task_run_id: {event_logger.context.task_run_id}")
 print(f"task_attempt_number: {event_logger.context.task_attempt_number}")
+print(f"job_run_url: {event_logger.job_run_url}")
 
 # COMMAND ----------
 
@@ -218,15 +234,13 @@ from pyspark.sql import functions as F
 
 demo_df = spark.createDataFrame(transformed_rows)
 
-with event_logger.event(
-    "developer_guide.demo_dataframe_counted",
-    event_type="spark_action",
-    metadata={
-        "action": "count",
-        "reason": "demonstrate context manager around Spark action",
-    },
-):
-    demo_row_count = demo_df.count()
+demo_row_count = count_rows(
+    demo_df,
+    event_name="developer_guide.demo_dataframe_counted",
+    table_name="developer_guide.demo_df",
+    action="count",
+    reason="demonstrate explicit Spark action helper",
+)
 
 print(f"demo_row_count={demo_row_count}")
 
@@ -315,17 +329,24 @@ print(f"child_parent_event_id={child_event.parent_event_id}")
 demo_target_table = dbutils.widgets.get("demo_target_table").strip()
 
 if demo_target_table:
-    with event_logger.event(
-        "developer_guide.demo_table_written",
-        event_type="delta_write",
-        target_table=demo_target_table,
+    lowered_target = demo_target_table.lower()
+    if "sandbox" not in lowered_target and "_demo" not in lowered_target:
+        raise ValueError(
+            "demo_target_table must contain 'sandbox' or '_demo' to protect "
+            "non-demo tables from overwrite."
+        )
+
+    write_delta(
+        demo_df,
+        demo_target_table,
+        mode="overwrite",
         row_count=demo_row_count,
+        options={"overwriteSchema": "true"},
         metadata={
-            "mode": "overwrite",
             "source": "developer guide demo_df",
+            "safety_check": "target name contains sandbox or _demo",
         },
-    ):
-        demo_df.write.format("delta").mode("overwrite").saveAsTable(demo_target_table)
+    )
 
     event_logger.record_event(
         "developer_guide.demo_table_write_confirmed",
@@ -334,6 +355,17 @@ if demo_target_table:
         target_table=demo_target_table,
         metadata={"confirmation": "write call returned"},
     )
+
+    run_sql(
+        f"REFRESH TABLE {demo_target_table}",
+        metadata={"reason": "developer guide write verification"},
+    )
+    confirmed_row_count = validate_row_count(
+        demo_target_table,
+        expected_exact=demo_row_count,
+        metadata={"validation_name": "demo_target_row_count"},
+    )
+    print(f"confirmed_row_count={confirmed_row_count}")
 else:
     event_logger.record_event(
         "developer_guide.demo_table_write_skipped",

@@ -25,6 +25,12 @@ from databricks_event_logger.config import EventLoggerConfig
 from databricks_event_logger.context import RuntimeContext, resolve_databricks_context
 from databricks_event_logger.errors import EventLoggerConfigurationError
 from databricks_event_logger.event import EventRecord
+from databricks_event_logger.serialization import (
+    DEFAULT_METADATA_MAX_BYTES,
+    DEFAULT_METADATA_STRING_MAX_CHARS,
+    DEFAULT_REDACT_KEYS,
+    serialize_metadata,
+)
 from databricks_event_logger.sinks.base import EventSink
 from databricks_event_logger.sinks.delta import DeltaSink
 from databricks_event_logger.sinks.memory import MemorySink
@@ -67,6 +73,25 @@ class EventLogger:
     event_table : str | None, default None
         Fully qualified event table for Delta-backed usage. Stored in config
         but not used unless a Delta sink is configured.
+    default_metadata : dict[str, Any] | None, default None
+        Metadata merged into every event emitted by this logger. Event-level
+        metadata wins when the same key appears in both places.
+    metadata_max_bytes : int | None, default 4000
+        Maximum serialized ``metadata_json`` size. ``None`` disables the cap.
+    metadata_string_max_chars : int | None, default 2000
+        Maximum string value length inside metadata. ``None`` disables string
+        truncation.
+    error_message_max_chars : int | None, default 2000
+        Maximum stored exception message length. ``None`` disables truncation.
+    redact_keys : tuple[str, ...], default DEFAULT_REDACT_KEYS
+        Case-insensitive metadata key fragments whose values are redacted.
+    strict_logging : bool, default False
+        When True, sink failures from successful business paths are raised
+        instead of warned. Failure-event logging still preserves the original
+        business exception.
+    max_events_warning_threshold : int | None, default 100
+        Warn once when a logger emits more than this many events. ``None``
+        disables the guardrail.
     """
 
     def __init__(
@@ -79,6 +104,13 @@ class EventLogger:
         context: RuntimeContext | None = None,
         correlation_id: str | None = None,
         event_table: str | None = None,
+        default_metadata: dict[str, Any] | None = None,
+        metadata_max_bytes: int | None = DEFAULT_METADATA_MAX_BYTES,
+        metadata_string_max_chars: int | None = DEFAULT_METADATA_STRING_MAX_CHARS,
+        error_message_max_chars: int | None = 2000,
+        redact_keys: tuple[str, ...] = DEFAULT_REDACT_KEYS,
+        strict_logging: bool = False,
+        max_events_warning_threshold: int | None = 100,
     ) -> None:
         """
         Create an event logger.
@@ -92,6 +124,41 @@ class EventLogger:
         self.context = context or RuntimeContext()
         self.correlation_id = correlation_id or str(uuid4())
         self.sink: EventSink = sink or MemorySink()
+        self.default_metadata = dict(default_metadata or {})
+        self.metadata_max_bytes = metadata_max_bytes
+        self.metadata_string_max_chars = metadata_string_max_chars
+        self.error_message_max_chars = error_message_max_chars
+        self.redact_keys = redact_keys
+        self.strict_logging = strict_logging
+        self.max_events_warning_threshold = max_events_warning_threshold
+        self._event_count = 0
+        self._event_threshold_warned = False
+
+    @property
+    def job_url(self) -> str | None:
+        """
+        Return the Databricks job UI URL when workspace and job ids are known.
+
+        Returns
+        -------
+        str | None
+            URL shaped as ``https://<workspace>/jobs/<job_id>``, or ``None``
+            when the current context is not a Databricks job run.
+        """
+        return _job_url(self.context)
+
+    @property
+    def job_run_url(self) -> str | None:
+        """
+        Return the Databricks job-run UI URL when run identifiers are known.
+
+        Returns
+        -------
+        str | None
+            URL shaped as ``https://<workspace>/jobs/<job_id>/runs/<run_id>``,
+            or ``None`` when any required field is unavailable.
+        """
+        return _job_run_url(self.context)
 
     def record_event(
         self,
@@ -166,6 +233,12 @@ class EventLogger:
         EventRecord
             Event object that was handed to the sink.
         """
+        metadata_json = serialize_metadata(
+            self._merge_metadata(metadata),
+            redact_keys=self.redact_keys,
+            string_max_chars=self.metadata_string_max_chars,
+            max_bytes=self.metadata_max_bytes,
+        )
         event = EventRecord(
             event_name=event_name,
             event_type=event_type,
@@ -191,9 +264,9 @@ class EventLogger:
             metric_name=metric_name,
             metric_value=metric_value,
             error_class=error_class,
-            error_message=error_message,
+            error_message=self._bounded_text(error_message, self.error_message_max_chars),
             stack_trace_hash=stack_trace_hash,
-            metadata=metadata,
+            metadata_json=metadata_json,
         )
         self._emit(event)
         return event
@@ -497,14 +570,53 @@ class EventLogger:
         """
         Hand an event to the configured sink.
         """
+        self._event_count += 1
+        self._warn_on_event_volume()
         try:
             self.sink.emit(event)
         except Exception as exc:
+            if self.strict_logging:
+                raise
             warnings.warn(
                 f"Failed to emit event {event.event_name!r}: {exc}",
                 RuntimeWarning,
                 stacklevel=3,
             )
+
+    def _merge_metadata(self, metadata: dict[str, Any] | None) -> dict[str, Any] | None:
+        """
+        Merge logger defaults with event-level metadata.
+        """
+        if not self.default_metadata and not metadata:
+            return None
+        merged = dict(self.default_metadata)
+        if metadata:
+            merged.update(metadata)
+        return merged
+
+    def _bounded_text(self, value: str | None, max_chars: int | None) -> str | None:
+        """
+        Return a bounded text value for high-volume error fields.
+        """
+        if value is None or max_chars is None or max_chars < 0 or len(value) <= max_chars:
+            return value
+        return f"{value[:max_chars]}...[TRUNCATED]"
+
+    def _warn_on_event_volume(self) -> None:
+        """
+        Warn once when a logger emits more events than expected for one task.
+        """
+        threshold = self.max_events_warning_threshold
+        if threshold is None or self._event_threshold_warned or self._event_count <= threshold:
+            return
+        self._event_threshold_warned = True
+        warnings.warn(
+            "EventLogger has emitted more than "
+            f"{threshold} events in this logger instance. Consider aggregating "
+            "very chatty loops into summary events when possible.",
+            RuntimeWarning,
+            stacklevel=3,
+        )
 
     def _call_sink(self, method_name: str) -> None:
         """
@@ -572,6 +684,15 @@ class NotebookObserver:
         spark: Any | None = None,
         dbutils: Any | None = None,
         context: RuntimeContext | None = None,
+        require_persistence: bool = False,
+        validate_sink: bool = False,
+        default_metadata: dict[str, Any] | None = None,
+        metadata_max_bytes: int | None = DEFAULT_METADATA_MAX_BYTES,
+        metadata_string_max_chars: int | None = DEFAULT_METADATA_STRING_MAX_CHARS,
+        error_message_max_chars: int | None = 2000,
+        redact_keys: tuple[str, ...] = DEFAULT_REDACT_KEYS,
+        strict_logging: bool = False,
+        max_events_warning_threshold: int | None = 100,
     ) -> EventLogger:
         """
         Initialize the default logger and emit ``notebook.started``.
@@ -599,6 +720,17 @@ class NotebookObserver:
             Explicit runtime context.
             When omitted and ``dbutils`` is supplied, optional context widgets
             such as ``task_key`` and ``task_run_id`` are used as fallbacks.
+        require_persistence : bool, default False
+            When True, raise instead of falling back to ``MemorySink`` unless
+            the resolved sink is ``DeltaSink``.
+        validate_sink : bool, default False
+            When True and the resolved sink exposes ``validate()``, run that
+            validation before startup events are emitted.
+        default_metadata, metadata_max_bytes, metadata_string_max_chars,
+        error_message_max_chars, redact_keys, strict_logging,
+        max_events_warning_threshold
+            Logger-level metadata governance and production guardrails passed
+            to ``EventLogger``.
 
         Returns
         -------
@@ -630,6 +762,14 @@ class NotebookObserver:
                 )
             elif spark is not None and event_table:
                 resolved_sink = DeltaSink(spark=spark, table_name=event_table)
+        if require_persistence and not isinstance(resolved_sink, DeltaSink):
+            raise EventLoggerConfigurationError(
+                "Persistent event logging is required, but no DeltaSink could be "
+                "configured. Pass spark and a three-part observability_event_table, "
+                "or pass an explicit DeltaSink."
+            )
+        if validate_sink and hasattr(resolved_sink, "validate"):
+            resolved_sink.validate()
         logger = EventLogger(
             app_name=app_name,
             component=component,
@@ -637,9 +777,29 @@ class NotebookObserver:
             sink=resolved_sink,
             context=resolved_context,
             event_table=event_table,
+            default_metadata=default_metadata,
+            metadata_max_bytes=metadata_max_bytes,
+            metadata_string_max_chars=metadata_string_max_chars,
+            error_message_max_chars=error_message_max_chars,
+            redact_keys=redact_keys,
+            strict_logging=strict_logging,
+            max_events_warning_threshold=max_events_warning_threshold,
         )
         set_default_logger(logger)
-        logger.record_event("notebook.started", event_type="notebook", status="started")
+        logger.record_event(
+            "notebook.started",
+            event_type="notebook",
+            status="started",
+            metadata={
+                "sink_type": type(logger.sink).__name__,
+                "event_table": event_table,
+                "require_persistence": require_persistence,
+                "validate_sink": validate_sink,
+                "strict_logging": strict_logging,
+                "job_url": logger.job_url,
+                "job_run_url": logger.job_run_url,
+            },
+        )
         return logger
 
     def from_widgets(
@@ -648,6 +808,15 @@ class NotebookObserver:
         dbutils: Any | None = None,
         spark: Any | None = None,
         sink: EventSink | None = None,
+        require_persistence: bool = False,
+        validate_sink: bool = False,
+        default_metadata: dict[str, Any] | None = None,
+        metadata_max_bytes: int | None = DEFAULT_METADATA_MAX_BYTES,
+        metadata_string_max_chars: int | None = DEFAULT_METADATA_STRING_MAX_CHARS,
+        error_message_max_chars: int | None = 2000,
+        redact_keys: tuple[str, ...] = DEFAULT_REDACT_KEYS,
+        strict_logging: bool = False,
+        max_events_warning_threshold: int | None = 100,
     ) -> EventLogger:
         """
         Initialize a logger from standard Databricks widgets.
@@ -674,6 +843,17 @@ class NotebookObserver:
             are inspected for ``spark``.
         sink : EventSink | None, default None
             Explicit sink for tests or custom persistence.
+        require_persistence : bool, default False
+            When True, fail notebook bootstrap if a ``DeltaSink`` cannot be
+            configured.
+        validate_sink : bool, default False
+            When True, validate the resolved sink before emitting
+            ``notebook.started``.
+        default_metadata, metadata_max_bytes, metadata_string_max_chars,
+        error_message_max_chars, redact_keys, strict_logging,
+        max_events_warning_threshold
+            Logger-level metadata governance and production guardrails passed
+            through to ``observe_notebook(...)``.
 
         Returns
         -------
@@ -715,6 +895,15 @@ class NotebookObserver:
             spark=resolved_spark,
             dbutils=resolved_dbutils,
             context=context,
+            require_persistence=require_persistence,
+            validate_sink=validate_sink,
+            default_metadata=default_metadata,
+            metadata_max_bytes=metadata_max_bytes,
+            metadata_string_max_chars=metadata_string_max_chars,
+            error_message_max_chars=error_message_max_chars,
+            redact_keys=redact_keys,
+            strict_logging=strict_logging,
+            max_events_warning_threshold=max_events_warning_threshold,
         )
 
 
@@ -730,6 +919,38 @@ def _stack_trace_hash(exc: BaseException) -> str:
     """
     trace_text = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
     return hashlib.sha256(trace_text.encode("utf-8")).hexdigest()
+
+
+def _job_url(context: RuntimeContext) -> str | None:
+    """
+    Build the Databricks job URL from normalized runtime context.
+    """
+    workspace_url = _workspace_url_with_scheme(context.workspace_url)
+    if not workspace_url or not context.job_id:
+        return None
+    return f"{workspace_url}/jobs/{context.job_id}"
+
+
+def _job_run_url(context: RuntimeContext) -> str | None:
+    """
+    Build the Databricks job-run URL from normalized runtime context.
+    """
+    job_url = _job_url(context)
+    if not job_url or not context.run_id:
+        return None
+    return f"{job_url}/runs/{context.run_id}"
+
+
+def _workspace_url_with_scheme(workspace_url: str | None) -> str | None:
+    """
+    Return a browser-ready workspace URL.
+    """
+    if not workspace_url:
+        return None
+    normalized = workspace_url.strip().rstrip("/").lower()
+    if normalized.startswith("http://") or normalized.startswith("https://"):
+        return normalized
+    return f"https://{normalized}"
 
 
 def _widget_values(dbutils: Any | None) -> dict[str, str]:

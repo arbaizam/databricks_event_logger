@@ -9,7 +9,7 @@ affected by system clock adjustments.
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from time import perf_counter
 
 
@@ -22,7 +22,7 @@ def utc_now() -> datetime:
     datetime
         Current UTC time with ``tzinfo`` populated.
     """
-    return datetime.now(UTC)
+    return datetime.now(timezone.utc)
 
 
 def monotonic_ms() -> float:
