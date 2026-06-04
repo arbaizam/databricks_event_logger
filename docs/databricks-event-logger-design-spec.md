@@ -2,7 +2,7 @@
 
 Status: Draft  
 Last updated: 2026-06-03  
-Source: design conversation supplied in `pasted-text.txt` plus the shared ChatGPT conversation at `https://chatgpt.com/share/6a201654-a4a8-83ea-a835-e33884ce7531`
+
 
 ## 1. Purpose
 
