@@ -28,6 +28,36 @@ def test_runtime_context_from_mapping_ignores_unknown_fields():
     assert context.run_id is None
 
 
+def test_runtime_context_normalizes_workspace_url():
+    """
+    What: Normalizes workspace URLs to a bare lowercase hostname.
+    Why: Dashboard filters should not split rows by scheme or trailing slash.
+    Fails when: Context sources produce inconsistent workspace_url values.
+    """
+    context = RuntimeContext.from_mapping(
+        {
+            "workspace_url": "https://ADB-123.azuredatabricks.net/",
+        }
+    )
+
+    assert context.workspace_url == "adb-123.azuredatabricks.net"
+
+
+def test_context_resolver_uses_standard_username_env_var(monkeypatch):
+    """
+    What: Resolves username from the standard Databricks SDK environment name.
+    Why: Non-standard environment keys should not be the only env fallback path.
+    Fails when: Environment context misses DATABRICKS_USERNAME.
+    """
+    monkeypatch.setenv("DATABRICKS_USERNAME", "user@example.com")
+    monkeypatch.setenv("DATABRICKS_HOST", "https://ADB-123.azuredatabricks.net/")
+
+    context = resolve_databricks_context()
+
+    assert context.user_name == "user@example.com"
+    assert context.workspace_url == "adb-123.azuredatabricks.net"
+
+
 def test_context_resolver_uses_spark_config_when_available():
     """
     What: Resolves Spark configuration fields without Databricks imports.

@@ -64,7 +64,7 @@ class EventRecord:
     parent_event_id: str | None
 
     event_ts: datetime
-    event_date: date | None
+    event_date: date
     start_ts: datetime | None
     end_ts: datetime | None
     duration_ms: int | None

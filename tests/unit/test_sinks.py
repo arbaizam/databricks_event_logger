@@ -3,11 +3,9 @@ import json
 
 import pytest
 
+from databricks_event_logger import ConsoleSink, DeltaSink, MemorySink
 from databricks_event_logger.errors import EventLoggerConfigurationError
 from databricks_event_logger.event import EventRecord
-from databricks_event_logger.sinks.console import ConsoleSink
-from databricks_event_logger.sinks.delta import DeltaSink
-from databricks_event_logger.sinks.memory import MemorySink
 
 
 def test_memory_sink_stores_events_in_order():
@@ -52,12 +50,26 @@ def test_delta_sink_requires_table_name():
         DeltaSink(spark=object(), table_name="")
 
 
+def test_delta_sink_rejects_unsafe_table_name():
+    """
+    What: Rejects table names that are not simple three-part UC identifiers.
+    Why: DeltaSink interpolates the table identifier into SQL and must fail closed.
+    Fails when: Widget-sourced table names can inject arbitrary SQL.
+    """
+    with pytest.raises(EventLoggerConfigurationError, match="three-part"):
+        DeltaSink(
+            spark=object(),
+            table_name="catalog.schema.event_log; DROP TABLE catalog.schema.event_log",
+        )
+
+
 def test_delta_sink_inserts_through_sql_with_typed_staging_view():
     """
     What: Stages one typed event row and inserts it into an existing table via SQL.
     Why: SQL DDL owns table nullability, and DeltaSink must not create tables from PySpark.
     Fails when: DeltaSink goes back to DataFrameWriter.saveAsTable or inferred schemas.
     """
+    pytest.importorskip("pyspark")
     spark = _FakeSpark()
     sink = DeltaSink(spark=spark, table_name="catalog.schema.event_log")
     event = EventRecord("reporting.delta_write", metadata={"rows": 10})

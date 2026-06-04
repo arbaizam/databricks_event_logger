@@ -146,6 +146,27 @@ def test_run_task_records_success_and_return_value():
     assert sink.events[-1].status == "success"
 
 
+def test_run_task_records_failure_and_reraises_original_exception():
+    """
+    What: Runs a failing task callable and re-raises its original exception.
+    Why: Task wrapper logging must preserve Databricks job failure semantics.
+    Fails when: run_task swallows or replaces the business exception.
+    """
+    sink = MemorySink()
+    logger = EventLogger(sink=sink)
+
+    def fail():
+        raise ValueError("task boom")
+
+    with pytest.raises(ValueError, match="task boom"):
+        logger.run_task("reporting.task", fail)
+
+    assert sink.events[-1].event_name == "reporting.task"
+    assert sink.events[-1].event_type == "task"
+    assert sink.events[-1].status == "failed"
+    assert sink.events[-1].error_class == "ValueError"
+
+
 def test_record_metric_defaults_event_name():
     """
     What: Uses the metric name to build a default metric event name.
@@ -240,6 +261,34 @@ def test_observe_notebook_from_widgets_uses_optional_context_widgets():
     assert sink.events[-1].task_run_id == "task-run-1"
 
 
+def test_observe_notebook_from_widgets_uses_delta_sink_when_configured():
+    """
+    What: Creates a DeltaSink when widgets provide an event table and Spark is supplied.
+    Why: The standard job bootstrap path should persist events without extra sink wiring.
+    Fails when: from_widgets falls back to MemorySink despite complete persistence config.
+    """
+    pytest.importorskip("pyspark")
+
+    dbutils = FakeDbutils(
+        {
+            "app_name": "app",
+            "component": "component",
+            "environment": "dev",
+            "observability_event_table": "catalog.schema.event_log",
+        }
+    )
+    spark = FakeSpark()
+
+    def run():
+        logger = observe_notebook.from_widgets(dbutils=dbutils, spark=spark)
+
+        assert type(logger.sink).__name__ == "DeltaSink"
+        assert spark.sql_calls[0].startswith("INSERT INTO catalog.schema.event_log")
+        assert spark.data[0]["event_name"] == "notebook.started"
+
+    Context().run(run)
+
+
 def test_observe_notebook_direct_uses_optional_context_widgets():
     """
     What: Uses optional widget values when bootstrapping directly.
@@ -271,6 +320,69 @@ def test_observe_notebook_direct_uses_optional_context_widgets():
     assert sink.events[-1].task_key == "smoke_task"
 
 
+def test_observe_notebook_warns_when_event_table_cannot_persist():
+    """
+    What: Warns when an event table is supplied without a Spark session.
+    Why: Production jobs should not silently fall back to non-persistent memory events.
+    Fails when: Missing Spark causes silent event loss.
+    """
+    def run():
+        with pytest.warns(RuntimeWarning, match="observability_event_table"):
+            logger = observe_notebook(
+                app_name="app",
+                component="component",
+                environment="dev",
+                event_table="catalog.schema.event_log",
+            )
+        assert isinstance(logger.sink, MemorySink)
+
+    Context().run(run)
+
+
+def test_observe_notebook_warns_when_spark_has_no_event_table():
+    """
+    What: Warns when Spark is supplied but no event table is configured.
+    Why: A Spark-backed job usually expects Delta persistence.
+    Fails when: Missing event table causes silent MemorySink fallback.
+    """
+    def run():
+        with pytest.warns(RuntimeWarning, match="observability_event_table"):
+            logger = observe_notebook(
+                app_name="app",
+                component="component",
+                environment="dev",
+                spark=object(),
+            )
+        assert isinstance(logger.sink, MemorySink)
+
+    Context().run(run)
+
+
+def test_observe_notebook_from_widgets_warns_on_frame_inspection():
+    """
+    What: Warns when dbutils is discovered through caller-frame inspection.
+    Why: Production notebooks should pass dbutils and spark explicitly.
+    Fails when: Fragile implicit lookup remains invisible to developers.
+    """
+    def run():
+        dbutils = FakeDbutils(
+            {
+                "app_name": "app",
+                "component": "component",
+                "environment": "dev",
+            }
+        )
+        sink = MemorySink()
+
+        with pytest.warns(RuntimeWarning, match="frame inspection"):
+            logger = observe_notebook.from_widgets(sink=sink)
+
+        assert logger.config.app_name == "app"
+        assert dbutils.widgets.get("app_name") == "app"
+
+    Context().run(run)
+
+
 def test_get_default_logger_requires_bootstrap():
     """
     What: Raises a clear configuration error when no default logger exists.
@@ -279,6 +391,39 @@ def test_get_default_logger_requires_bootstrap():
     """
     with pytest.raises(EventLoggerConfigurationError):
         Context().run(get_default_logger)
+
+
+def test_logging_failure_warns_and_preserves_success_return_value():
+    """
+    What: Lets successful business code return even when event emission fails.
+    Why: V1 logging should not fail successful business workflows.
+    Fails when: Sink failures replace successful function results.
+    """
+    logger = EventLogger(sink=FailingSink())
+
+    @logger.logged_event("reporting.success")
+    def work():
+        return "ok"
+
+    with pytest.warns(RuntimeWarning, match="Failed to emit event"):
+        assert work() == "ok"
+
+
+def test_failure_logging_failure_preserves_original_exception():
+    """
+    What: Re-raises the business exception when failure-event emission fails.
+    Why: A broken sink must not mask the exception that should fail the task.
+    Fails when: Logging exceptions replace business exceptions.
+    """
+    logger = EventLogger(sink=FailingSink())
+
+    @logger.logged_event("reporting.failure")
+    def fail():
+        raise ValueError("business failure")
+
+    with pytest.warns(RuntimeWarning, match="Failed to emit event"):
+        with pytest.raises(ValueError, match="business failure"):
+            fail()
 
 
 class FakeDbutils:
@@ -297,3 +442,33 @@ class FakeWidgets:
 
     def getAll(self):  # noqa: N802 - Databricks widget API casing.
         return dict(self._values)
+
+
+class FakeSpark:
+    def __init__(self):
+        self.data = None
+        self.dataframe = FakeDataFrame()
+        self.sql_calls = []
+
+    def createDataFrame(self, data, schema=None):  # noqa: N802 - Spark API casing.
+        self.data = data
+        return self.dataframe
+
+    def sql(self, query):
+        self.sql_calls.append(" ".join(query.split()))
+
+
+class FakeDataFrame:
+    def createOrReplaceTempView(self, name):  # noqa: N802 - Spark API casing.
+        self.view_name = name
+
+
+class FailingSink:
+    def emit(self, event):
+        raise RuntimeError("sink unavailable")
+
+    def flush(self):
+        pass
+
+    def close(self):
+        pass

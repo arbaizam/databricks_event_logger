@@ -612,8 +612,24 @@ class NotebookObserver:
             fallback=_context_from_widgets(widget_values),
         )
         resolved_sink = sink
-        if resolved_sink is None and spark is not None and event_table:
-            resolved_sink = DeltaSink(spark=spark, table_name=event_table)
+        if resolved_sink is None:
+            if event_table and spark is None:
+                warnings.warn(
+                    "observability_event_table was provided but no Spark session was supplied. "
+                    "Events will be stored in MemorySink and will not be persisted.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+            elif spark is not None and not event_table:
+                warnings.warn(
+                    "A Spark session was supplied but observability_event_table "
+                    "is missing or blank. Events will be stored in MemorySink "
+                    "and will not be persisted.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+            elif spark is not None and event_table:
+                resolved_sink = DeltaSink(spark=spark, table_name=event_table)
         logger = EventLogger(
             app_name=app_name,
             component=component,
@@ -664,8 +680,26 @@ class NotebookObserver:
         EventLogger
             Configured default logger.
         """
-        resolved_dbutils = dbutils or _caller_global("dbutils")
-        resolved_spark = spark or _caller_global("spark")
+        resolved_dbutils = dbutils
+        if resolved_dbutils is None:
+            resolved_dbutils = _caller_global("dbutils")
+            if resolved_dbutils is not None:
+                warnings.warn(
+                    "observe_notebook.from_widgets() found dbutils through frame inspection. "
+                    "Pass dbutils explicitly in production notebooks.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+        resolved_spark = spark
+        if resolved_spark is None:
+            resolved_spark = _caller_global("spark")
+            if resolved_spark is not None:
+                warnings.warn(
+                    "observe_notebook.from_widgets() found spark through frame inspection. "
+                    "Pass spark explicitly in production notebooks.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
         widget_values = _widget_values(resolved_dbutils)
         context = resolve_databricks_context(
             dbutils=resolved_dbutils,

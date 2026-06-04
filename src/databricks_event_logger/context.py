@@ -83,7 +83,7 @@ class RuntimeContext:
         if not values:
             return cls()
         allowed = cls.__dataclass_fields__.keys()
-        return cls(**{key: _string_or_none(values.get(key)) for key in allowed})
+        return cls(**{key: _context_value(key, values.get(key)) for key in allowed})
 
     def as_dict(self) -> dict[str, str | None]:
         """
@@ -161,8 +161,7 @@ def _context_from_environment() -> dict[str, str]:
         "task_attempt_number": "DATABRICKS_TASK_ATTEMPT_NUMBER",
         "job_start_time": "DATABRICKS_JOB_START_TIME",
         "job_trigger_type": "DATABRICKS_JOB_TRIGGER_TYPE",
-        "user_name": "DATABRICKS_USER",
-        "run_as_user_name": "DATABRICKS_RUN_AS_USER",
+        "user_name": "DATABRICKS_USERNAME",
     }
     return {
         field: value
@@ -368,8 +367,32 @@ def _string_or_none(value: Any) -> str | None:
     return text or None
 
 
+def _context_value(field_name: str, value: Any) -> str | None:
+    """
+    Return a normalized string value for one context field.
+    """
+    if field_name == "workspace_url":
+        return _normalize_workspace_url(value)
+    return _string_or_none(value)
+
+
+def _normalize_workspace_url(value: Any) -> str | None:
+    """
+    Normalize workspace URLs to a bare lowercase hostname.
+    """
+    text = _string_or_none(value)
+    if text is None:
+        return None
+    lowered = text.lower()
+    if lowered.startswith("https://"):
+        text = text[8:]
+    elif lowered.startswith("http://"):
+        text = text[7:]
+    return text.rstrip("/").split("/", 1)[0].lower()
+
+
 _CONTEXT_KEY_MAP = {
-    "workspace_id": ("orgId", "workspaceId", "workspace_id", "workspaceId"),
+    "workspace_id": ("orgId", "workspaceId", "workspace_id"),
     "workspace_url": ("browserHostName", "apiUrl", "workspaceUrl", "workspace_url"),
     "cluster_id": ("clusterId", "cluster_id"),
     "job_id": ("jobId", "job_id"),

@@ -302,12 +302,12 @@ observe_notebook.from_widgets()
 - Resolve Databricks context where available.
 - Set the logger as the default logger.
 - Emit `notebook.started`.
-- Register best-effort flush/completion behavior.
 
 Important lifecycle decision:
 
 - Databricks system tables are authoritative for task and job completion.
-- SDK-level `notebook.completed` should be best effort unless the caller uses an explicit lifecycle wrapper.
+- V1 does not emit automatic SDK-level `notebook.completed` events from `observe_notebook()` alone.
+- Use `logger.run_task(..., main)` when an explicit SDK-level success/failure boundary is required.
 - Operation-level decorators and helpers must reliably emit success/failure for the code they wrap.
 
 ### 6.3 Default Logger
@@ -957,7 +957,7 @@ Recommended Delta behavior:
 
 - Append events to the configured Delta table.
 - Use immediate writes for v1: each event is persisted when emitted.
-- Provide a best-effort flush at notebook/job end.
+- Keep `flush()` available on the sink interface even though DeltaSink has no buffered events in v1.
 - Do not let sink failures mask business failures.
 
 Immediate writes are simpler and reduce the chance of losing events if the notebook or cluster terminates. The tradeoff is more small Delta writes. Because v1 instrumentation should be coarse-grained, that tradeoff is acceptable.
@@ -1152,11 +1152,9 @@ The SDK decorators and helper functions contain the `try`/`except` internally. T
 
 ### Can a single `observe_notebook()` call guarantee `notebook.completed`?
 
-Not in every failure mode. It can emit `notebook.started`, configure the default logger, and register best-effort flush/completion behavior. Databricks system tables should remain authoritative for final task status.
+No. In V1, `observe_notebook()` emits `notebook.started` and configures the default logger. It does not emit `notebook.completed`. Databricks system tables should remain authoritative for final task status.
 
-Best-effort means the SDK tries to log completion through normal Python cleanup paths, but it may not run if the interpreter, cluster, or job is terminated abruptly.
-
-Explicit means the notebook work is wrapped in a callable such as `logger.run_task("event.name", main)`. In that pattern, the wrapper owns the success/failure boundary and can reliably log completion for normal Python success and exception paths.
+Explicit SDK-level completion means the notebook work is wrapped in a callable such as `logger.run_task("event.name", main)`. In that pattern, the wrapper owns the success/failure boundary and can reliably log completion for normal Python success and exception paths.
 
 ### Should the SDK automatically count DataFrame rows?
 
@@ -1241,7 +1239,7 @@ These decisions were resolved during design review:
 - No formal naming review process is required for v1; use lightweight team conventions.
 - DeltaSink uses immediate writes in v1. Buffered writes are a future optimization.
 - Domain-specific event details are deferred to v2.
-- `observe_notebook()` completion is best effort. Use `logger.run_task(..., main)` when explicit SDK-level success/failure lifecycle logging is required.
+- `observe_notebook()` emits startup only. Use `logger.run_task(..., main)` when explicit SDK-level success/failure lifecycle logging is required.
 - Wheel build/deploy is handled outside the package through Asset Bundles for now.
 - Private packages do not need event logging internally in v1.
 - Context manager and task wrapper APIs are required in v1.

@@ -9,6 +9,7 @@ interface if event volume makes small writes too expensive.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Any
 from uuid import uuid4
@@ -58,6 +59,11 @@ EVENT_COLUMNS = (
     "created_at",
 )
 
+_IDENTIFIER_PART = r"[A-Za-z_][A-Za-z0-9_]*"
+_THREE_PART_TABLE_NAME = re.compile(
+    rf"{_IDENTIFIER_PART}\.{_IDENTIFIER_PART}\.{_IDENTIFIER_PART}"
+)
+
 
 @dataclass
 class DeltaSink:
@@ -70,7 +76,8 @@ class DeltaSink:
         Spark session. It is typed as ``Any`` so the package does not require
         PySpark to be importable outside Databricks.
     table_name : str
-        Fully qualified Delta table name.
+        Fully qualified Delta table name. V1 accepts only simple three-part
+        Unity Catalog identifiers such as ``catalog.schema.event_log``.
     """
 
     spark: Any
@@ -84,6 +91,13 @@ class DeltaSink:
             raise EventLoggerConfigurationError("DeltaSink requires a Spark session.")
         if not self.table_name:
             raise EventLoggerConfigurationError("DeltaSink requires a table name.")
+        self.table_name = self.table_name.strip()
+        if not _THREE_PART_TABLE_NAME.fullmatch(self.table_name):
+            raise EventLoggerConfigurationError(
+                "DeltaSink table_name must be a three-part Unity Catalog identifier "
+                "using only letters, numbers, and underscores, for example "
+                "'catalog.schema.event_log'."
+            )
 
     def emit(self, event: EventRecord) -> None:
         """
