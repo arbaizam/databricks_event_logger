@@ -34,9 +34,11 @@ The v1 design background is in
 - [Required Notebook Widgets And Task Parameters](#required-notebook-widgets-and-task-parameters)
 - [Quickstart](#quickstart)
 - [How Sink Selection Works](#how-sink-selection-works)
-- [Public API](#public-api)
 - [Production Controls](#production-controls)
+- [Observability Readiness Check](#observability-readiness-check)
+- [Public API](#public-api)
 - [Spark Helper API](#spark-helper-api)
+- [Instrumentation Decision Tree](#instrumentation-decision-tree)
 - [Notebook Patterns](#notebook-patterns)
 - [Job And Task Patterns](#job-and-task-patterns)
 - [Package-Level Decorator Pattern](#package-level-decorator-pattern)
@@ -169,6 +171,9 @@ The package has no required third-party runtime dependencies. `pyspark` is only
 needed when using `DeltaSink`, and that import happens inside the Delta sink path
 in Databricks.
 
+Minimum runtime: use Python 3.10 or later. Confirm that the target Databricks
+Runtime uses Python 3.10+ before attaching the wheel.
+
 ## Event Table Setup
 
 Create the event table before using `DeltaSink`.
@@ -177,6 +182,18 @@ The template DDL lives in
 [resources/sql/create_event_log.sql](resources/sql/create_event_log.sql).
 Optional dashboard view templates live in
 [resources/sql/create_event_log_views.sql](resources/sql/create_event_log_views.sql).
+
+Migration setup order:
+
+1. Choose simple Unity Catalog object names made from letters, numbers, and
+   underscores.
+2. Create the target catalog.
+3. Create the target schema.
+4. Substitute `${observability_event_table}` with the fully qualified table name.
+5. Run [resources/sql/create_event_log.sql](resources/sql/create_event_log.sql).
+6. Grant the job run-as principal table write permission.
+7. Grant read/describe permission when using `validate_sink=True` or dashboards.
+8. Pass the table name as the `observability_event_table` task parameter.
 
 Replace `${observability_event_table}` with your fully qualified table name, for
 example:
@@ -196,6 +213,10 @@ Names requiring backticks or other special characters are intentionally rejected
 because the target table identifier is used in SQL `INSERT` statements. Use
 plain three-part UC object names such as
 `dev_observability.observability.event_log`.
+
+The SQL resource files are templates. `${observability_event_table}` and the
+view-name placeholders must be substituted by Asset Bundle deployment or
+manually replaced before running the SQL in a notebook or SQL editor.
 
 The table columns are:
 
@@ -245,8 +266,13 @@ USING DELTA;
 ```
 
 Permissions are handled outside the package. At minimum, the job's run-as
-principal needs permission to insert into the event table. Readers need select
-permission for dashboard/query use.
+principal needs permission to append rows to the event table. With Unity
+Catalog, that normally means `USE CATALOG`, `USE SCHEMA`, and table write
+permission such as `MODIFY`. When using `production_from_widgets(...)` or
+`validate_sink=True`, the run-as principal must also be able to run
+`DESCRIBE TABLE` against the event table, which commonly means `SELECT` or
+ownership depending on workspace policy. Dashboard and query readers also need
+read permission.
 
 ## Required Notebook Widgets And Task Parameters
 
@@ -282,6 +308,8 @@ Databricks dynamic value references must be passed into the task as parameters.
 They are not directly evaluated inside notebook code. Databricks documents the
 supported values here:
 [Databricks dynamic value references](https://docs.databricks.com/aws/en/jobs/dynamic-value-references).
+Verify `{{task.run_id}}` for the task types you plan to use; if a dynamic value
+does not resolve, the logger falls back to the other available run context.
 
 When both widgets/task parameters and heuristic runtime context are available,
 the explicit widget/task-parameter values win. This keeps the job contract
@@ -340,38 +368,79 @@ base_parameters:
   notebook_path: "{{task.notebook_path}}"
 ```
 
+Reusable bundle snippets live in:
+
+- [resources/observability.yml](resources/observability.yml) for standard
+  observability variables and view names.
+- [resources/asset_bundle_observability_parameters.yml](resources/asset_bundle_observability_parameters.yml)
+  for a copy/paste notebook task `base_parameters` block.
+
 ## Quickstart
 
-Use this at the top of a Databricks notebook task:
+The shortest copy/paste notebook is
+[notebooks/golden_path_notebook.py](notebooks/golden_path_notebook.py).
+
+Use this as the starting shape for interactive development or a Databricks
+notebook task:
 
 ```python
 from databricks_event_logger import observe_notebook
+from databricks_event_logger.spark import read_table, validate_row_count, write_delta
 
 event_logger = observe_notebook.from_widgets(
     dbutils=dbutils,
     spark=spark,
 )
+
+as_of_date = dbutils.widgets.get("as_of_date")
+
+source_df = read_table(
+    "catalog.schema.source",
+    as_of_date=as_of_date,
+)
+
+output_df = source_df.select("id", "amount", "AsOfDate")
+
+write_delta(
+    output_df,
+    table="catalog.schema.output",
+    mode="overwrite",
+    replace_where=f"AsOfDate = DATE '{as_of_date}'",
+    as_of_date=as_of_date,
+)
+
+validate_row_count(
+    table="catalog.schema.output",
+    expected_min=1,
+    validation_name="output_not_empty",
+    as_of_date=as_of_date,
+)
 ```
 
-This does four things:
+The bootstrap call does four things:
 
 1. Reads the standard widgets.
 2. Resolves best-effort Databricks runtime context.
 3. Creates and stores the default logger.
 4. Emits `notebook.started`.
 
-Then log a custom event:
+The Spark helpers then emit standard read, write, and validation events without
+requiring hand-written `try`/`except` blocks or context managers.
+
+For scheduled production jobs with a deployed event table, prefer the
+production preset:
 
 ```python
-event_logger.record_event(
-    "example.checkpoint",
-    event_type="custom",
-    status="success",
-    metadata={
-        "step": "bootstrap_complete",
-    },
+event_logger = observe_notebook.production_from_widgets(
+    dbutils=dbutils,
+    spark=spark,
 )
 ```
+
+That preset requires Delta persistence, validates the event table before
+`notebook.started`, and enables strict logging for successful business paths.
+It is intentionally fail-fast; use `from_widgets(...)` while iterating
+interactively if the event table is not configured yet.
 
 Inspect the emitted events. When the sink is `DeltaSink`, query the event table.
 When the sink is `MemorySink`, inspect the in-memory events for this Python
@@ -379,9 +448,11 @@ process:
 
 ```python
 if type(event_logger.sink).__name__ == "DeltaSink":
+    from pyspark.sql import functions as F
+
     display(
         spark.table(dbutils.widgets.get("observability_event_table"))
-        .where("event_name in ('notebook.started', 'example.checkpoint')")
+        .where(F.col("correlation_id") == event_logger.correlation_id)
         .orderBy("event_ts", ascending=False)
     )
 else:
@@ -448,7 +519,24 @@ looks misconfigured:
 ## Production Controls
 
 Development notebooks can rely on the default best-effort behavior. Production
-jobs should usually opt into stricter bootstrap checks:
+jobs should usually use the production preset:
+
+```python
+event_logger = observe_notebook.production_from_widgets(
+    dbutils=dbutils,
+    spark=spark,
+    default_metadata={
+        "workflow": "daily_positions",
+        "owner": "finance_data",
+    },
+)
+```
+
+This preset requires Delta persistence, validates the sink before emitting
+`notebook.started`, enables strict logging for successful business paths, and
+keeps the event-volume warning threshold at `100`.
+
+The equivalent explicit setup is:
 
 ```python
 event_logger = observe_notebook.from_widgets(
@@ -498,6 +586,45 @@ The startup event `notebook.started` also includes bootstrap diagnostics in
 `validate_sink`, `strict_logging`, `job_url`, and `job_run_url`. That makes the
 first event in a run useful for debugging configuration and quick navigation.
 
+## Observability Readiness Check
+
+Use `assert_observability_ready(...)` when you want a preflight check before any
+events are emitted:
+
+```python
+from databricks_event_logger import assert_observability_ready
+
+report = assert_observability_ready(
+    dbutils=dbutils,
+    spark=spark,
+    require_persistence=True,
+    validate_sink=True,
+)
+
+print(report.summary())
+```
+
+The helper verifies widget/table configuration, determines whether the runtime
+would use `DeltaSink` or `MemorySink`, resolves available Databricks context
+fields, and optionally validates the event table schema. It returns an
+`ObservabilityReadinessReport` on success and raises
+`EventLoggerConfigurationError` with the report summary on failure.
+
+For non-raising diagnostics:
+
+```python
+from databricks_event_logger import check_observability_ready
+
+report = check_observability_ready(
+    dbutils=dbutils,
+    spark=spark,
+    require_persistence=True,
+    validate_sink=False,
+)
+
+display(report.as_dict())
+```
+
 ## Public API
 
 ### `observe_notebook(...)`
@@ -535,6 +662,53 @@ event_logger = observe_notebook.from_widgets(dbutils=dbutils, spark=spark)
 This is the preferred Databricks notebook task pattern. It keeps notebook
 boilerplate low and lets Asset Bundles own environment-specific configuration.
 
+### `observe_notebook.production_from_widgets(...)`
+
+Production widget-driven bootstrap:
+
+```python
+from databricks_event_logger import observe_notebook
+
+event_logger = observe_notebook.production_from_widgets(
+    dbutils=dbutils,
+    spark=spark,
+)
+```
+
+Use this for normal production job tasks. It is the lowest-friction way to enable
+the recommended production controls without repeating three flags in every
+notebook. It requires a configured Delta event table; use
+`observe_notebook.from_widgets(...)` for local tests and interactive notebooks
+that should tolerate `MemorySink`.
+
+### Event Constants
+
+The package accepts plain strings, but common values are available as string
+enums:
+
+```python
+from databricks_event_logger import (
+    CommonEvent,
+    EventSeverity,
+    EventStatus,
+    EventType,
+)
+
+event_logger.record_event(
+    CommonEvent.DELTA_WRITE,
+    event_type=EventType.DELTA_WRITE,
+    status=EventStatus.SUCCESS,
+    severity=EventSeverity.INFO,
+)
+```
+
+Constants reduce typos while preserving the persisted string values such as
+`delta.write`, `delta_write`, and `success`. `CommonEvent.NOTEBOOK_COMPLETED`
+is available for caller-emitted events, but `observe_notebook(...)` does not
+emit it automatically. Use `EventStatus.WARNING` when the event outcome is a
+warning, and `EventSeverity.WARNING` when the event should be displayed at
+warning severity.
+
 ### `observed(...)`
 
 Module-level decorator:
@@ -551,6 +725,21 @@ def transform_inputs(df):
     return df.select("id", "amount")
 ```
 
+For metadata that depends on function arguments, use `metadata_factory`:
+
+```python
+@observed(
+    "example.transform_inputs",
+    event_type=EventType.BUSINESS_PROCESS,
+    metadata_factory=lambda df, *, as_of_date, ruleset: {
+        "as_of_date": as_of_date,
+        "ruleset": ruleset,
+    },
+)
+def transform_inputs(df, *, as_of_date: str, ruleset: str):
+    return df.select("id", "amount")
+```
+
 `observed(...)` resolves the default logger at call time. The notebook must call
 `observe_notebook(...)` or `set_default_logger(...)` before the decorated
 function is called.
@@ -563,6 +752,11 @@ Decorator events emit:
 - `start_ts`
 - `end_ts`
 - static metadata supplied to the decorator
+- call-time metadata returned by `metadata_factory`
+
+If `metadata_factory` raises, the wrapped function still runs. The package emits
+a Python `RuntimeWarning`, uses static metadata, and annotates the emitted event
+metadata with the factory error class and message.
 
 ### `EventLogger.logged_event(...)`
 
@@ -573,8 +767,9 @@ Logger-bound decorator:
     "example.prepare_snapshot",
     event_type="business_process",
     metadata={"snapshot_name": "daily_positions"},
+    metadata_factory=lambda *, as_of_date: {"as_of_date": as_of_date},
 )
-def prepare_snapshot():
+def prepare_snapshot(*, as_of_date: str):
     return build_snapshot()
 ```
 
@@ -703,6 +898,10 @@ This emits `event_name="delta.read"` and returns `spark.table(...)`. Spark reads
 are usually lazy, so this event means the DataFrame was requested. It does not
 prove rows were materialized.
 
+If the source table is missing or the caller lacks permission, the error may
+surface at the first downstream Spark action, such as a write, count, or
+validation, rather than at `read_table(...)`.
+
 ### `write_delta(...)`
 
 ```python
@@ -720,6 +919,10 @@ write_delta(
 This wraps `df.write.format("delta").mode(mode).saveAsTable(table_name)` and
 emits `event_name="delta.write"`. The helper does not call `count()`; pass
 `row_count` only when the workflow already has it.
+
+The default Spark write mode is `append`. Use `mode="overwrite"`,
+`replace_where=...`, or a workflow-specific merge/upsert pattern when reruns
+must avoid duplicate rows.
 
 ### `run_sql(...)`
 
@@ -783,6 +986,39 @@ if not table_exists(table="catalog.schema.source", check_context="startup"):
 
 This helper uses Spark catalog metadata and logs a validation event with
 `status="success"` when the table exists or `status="warning"` when it does not.
+
+## Instrumentation Decision Tree
+
+Use this as the default standard for new notebooks and packages:
+
+```text
+Use observe_notebook.from_widgets(...)
+  Every Databricks notebook or job task.
+
+Use observe_notebook.production_from_widgets(...)
+  Production notebook tasks where event persistence is required.
+
+Use Spark helpers
+  Standard reads, writes, SQL calls, table-existence checks, explicit counts,
+  and row-count validations.
+
+Use @observed(...)
+  Public business functions and public APIs in packages your team owns.
+  Use metadata_factory when metadata comes from function arguments.
+
+Use EventLogger.event(...)
+  Custom blocks that do not fit a helper or decorator.
+
+Use record_event(...)
+  Explicit checkpoints, decisions, warnings, or business milestones.
+
+Use record_metric(...)
+  Numeric values already known to the workflow.
+
+Do not log
+  Row-level operations, inner loops, every rule condition, raw sensitive SQL,
+  credentials, row samples, large payloads, or low-level utility functions.
+```
 
 ## Notebook Patterns
 
@@ -853,7 +1089,34 @@ For persisted logging, each notebook task should have:
 - an existing event table
 - task parameters or widgets for app/component/environment/table
 - `spark` and `dbutils` passed to `observe_notebook.from_widgets(...)`
-- insert permission on the event table
+- table write permission, plus describe/read permission when validating the sink
+
+### Python Script Tasks
+
+Notebook tasks provide `spark` and `dbutils` globals. Python script tasks do
+not always inject those globals, so pass them explicitly:
+
+```python
+from databricks.sdk.runtime import dbutils
+from pyspark.sql import SparkSession
+
+from databricks_event_logger import observe_notebook
+
+spark = SparkSession.builder.getOrCreate()
+event_logger = observe_notebook.from_widgets(dbutils=dbutils, spark=spark)
+```
+
+If `databricks.sdk.runtime` is not available in your runtime, create `dbutils`
+from Spark:
+
+```python
+from pyspark.dbutils import DBUtils
+
+dbutils = DBUtils(spark)
+```
+
+Also pass `spark=...` to Spark helpers when the script does not expose a module
+or local variable named `spark` near the helper call.
 
 ### Standard Task Bootstrap
 
@@ -892,10 +1155,45 @@ exception so the Databricks task still fails normally.
 
 ## Package-Level Decorator Pattern
 
-For pre-existing packages, keep the package implementation unchanged and wrap
-the public method at the notebook or application boundary. This is usually the
-lowest-friction production pattern because it avoids new package dependencies
-and still gives dashboards a stable event around the business operation.
+For packages your team owns, prefer decorating public business APIs directly.
+That makes instrumentation part of the package contract and keeps notebooks
+focused on orchestration:
+
+```python
+from databricks_event_logger import EventType, observed
+
+
+@observed(
+    "rules_engine.evaluate_dataframe",
+    event_type=EventType.BUSINESS_PROCESS,
+    metadata_factory=lambda input_df, *, ruleset_name, version=None, **kwargs: {
+        "ruleset_name": ruleset_name,
+        "version": version,
+    },
+)
+def evaluate_dataframe(input_df, *, ruleset_name: str, version: str | None = None, **kwargs):
+    return _evaluate_dataframe_internal(
+        input_df,
+        ruleset_name=ruleset_name,
+        version=version,
+        **kwargs,
+    )
+```
+
+Notebook usage stays clean:
+
+```python
+evaluated_df = evaluate_dataframe(
+    source_df,
+    ruleset_name="MVE_DOE_POSITION_MAPPING",
+    version="2026.06.01",
+)
+```
+
+For third-party, legacy, or pre-existing packages that you do not want to modify,
+keep the package implementation unchanged and wrap the public method at the
+notebook or application boundary. This still gives dashboards a stable event
+around the business operation.
 
 ```python
 from databricks_event_logger import observed
@@ -1161,8 +1459,14 @@ also emit `source_table.as_of_date_changed`.
 Use `record_event(...)` directly when severity depends on runtime values.
 
 ```python
+from databricks_event_logger.spark import count_rows
+
 warning_threshold = 0
-error_count = evaluated_df.where("rules_engine_error is not null").count()
+error_count = count_rows(
+    evaluated_df.where("rules_engine_error is not null"),
+    event_name="rules_engine.row_errors.counted",
+    table_name="catalog.schema.rules_output",
+)
 
 event_logger.record_event(
     "rules_engine.row_errors_checked",
@@ -1182,7 +1486,18 @@ workflow should fail, raise an exception after logging the condition.
 ## Parent And Correlation IDs
 
 Every `EventLogger` has one `correlation_id`. All events from that logger share
-it.
+it. When no explicit `correlation_id` is supplied, the logger derives a
+task-run correlation ID from Databricks context:
+
+- `task_run_id` when available
+- `run_id:task_key:task_attempt_number` when task and attempt fields are known
+- `run_id:task_key` when task is known but attempt is not
+- `run_id` when only the job run is known
+- a random UUID outside Databricks job context
+
+Pass an explicit `correlation_id` when several tasks, notebooks, or retries
+should be grouped under one ID. For cross-task dashboards, `run_id` is usually
+the better grouping key.
 
 Decorators, `run_task(...)`, and context managers create an active parent event
 while the wrapped function/block is running. Direct `record_event(...)` calls
@@ -1295,12 +1610,17 @@ Tune these defaults with `metadata_max_bytes`, `metadata_string_max_chars`, and
 
 The optional view template
 [resources/sql/create_event_log_views.sql](resources/sql/create_event_log_views.sql)
-adds three dashboard-friendly views:
+adds dashboard-friendly views for:
 
 - recent events with `job_url` and `job_run_url`
 - failure-first events with direct job-run navigation
 - run summaries with event counts, failure counts, warning counts, and first/last
   event timestamps
+- slow or long-running events
+- Delta read/write operations
+- validation results
+- metrics
+- business-process events
 
 ### Recent Events
 

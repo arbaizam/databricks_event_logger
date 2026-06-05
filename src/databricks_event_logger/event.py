@@ -12,6 +12,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass
 from datetime import date, datetime
+from enum import Enum
 from typing import Any
 from uuid import uuid4
 
@@ -145,6 +146,11 @@ class EventRecord:
         """
         Create an event record.
         """
+        event_name = _text_value(event_name)
+        event_type = _text_value(event_type)
+        status = _text_value(status)
+        severity = _text_value(severity)
+
         _validate_required_text(
             event_name,
             field_name="event_name",
@@ -254,6 +260,15 @@ def _validate_required_text(value: str, *, field_name: str, max_chars: int) -> N
         raise ValueError(f"{field_name} must be a non-empty string.")
     if len(value) > max_chars:
         raise ValueError(f"{field_name} must be {max_chars} characters or fewer.")
+
+
+def _text_value(value: Any) -> Any:
+    """
+    Return enum values as their underlying text for storage.
+    """
+    if isinstance(value, Enum):
+        return value.value
+    return value
 
 
 def _validate_choice(

@@ -74,7 +74,8 @@ def read_table(
     Spark table reads are usually lazy. This helper records that the DataFrame
     was requested, not that all rows were materialized. Use
     ``validate_row_count`` or a custom event around an action when you need a
-    materialized-count event.
+    materialized-count event. Missing-table and permission errors can surface at
+    the first downstream Spark action instead of at this helper call.
     """
     resolved_logger = _resolve_logger(logger)
     resolved_spark = _resolve_spark(spark)
@@ -124,7 +125,9 @@ def write_delta(
     logger : EventLogger | None, default None
         Logger to use. When omitted, the current default logger is used.
     mode : str, default "append"
-        Spark write mode.
+        Spark write mode. The default append mode can duplicate rows on reruns;
+        pass overwrite, replaceWhere options, or workflow-specific merge logic
+        when reruns must be idempotent.
     event_name : str, default "delta.write"
         Event name to emit.
     overwrite_schema : bool, default False

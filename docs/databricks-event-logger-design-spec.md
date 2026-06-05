@@ -178,11 +178,16 @@ Supported event types:
 
 ### 5.4 Correlation ID
 
-`correlation_id` groups all events emitted during one logical execution.
+`correlation_id` groups all events emitted by one logger instance. By default,
+the SDK uses task-run correlation in Databricks jobs.
 
 Recommended behavior:
 
-- In a Databricks task run, use a stable value derived from available run context, such as job run ID, task key, and attempt number.
+- In a Databricks task run, prefer `task_run_id` when available.
+- If `task_run_id` is unavailable, use a stable value derived from job run ID,
+  task key, and attempt number.
+- Callers can pass an explicit `correlation_id` when several tasks, notebooks,
+  or retries should share one correlation key.
 - Outside Databricks, generate a UUID during logger initialization.
 - Preserve the generated ID for the lifetime of the logger.
 
@@ -1014,7 +1019,8 @@ Recommended logging layers:
 Notebook / job entry point          yes
 Application-level functions         yes
 Custom notebook/code blocks         yes
-Domain package public API           optional / v2
+Owned domain package public API     yes
+Third-party/legacy package API      wrap externally
 Internal package functions          usually no
 Low-level utilities                 usually no
 ```
@@ -1037,13 +1043,17 @@ Do not normally log these:
 - Individual row transformation.
 - Inner-loop rule condition evaluation.
 
-Private domain packages do not need to import `databricks_event_logger` internally in v1. Instrumentation should happen at the notebook, job, application function, helper, context-manager, or task-wrapper layer.
+Owned domain packages should use decorators on stable public business APIs when
+the package is already part of the Databricks workload. Third-party, generic, or
+legacy packages can still be instrumented at the notebook, job, application
+function, helper, context-manager, or task-wrapper layer.
 
 Recommended coupling model:
 
-- Use no logger dependency for private domain packages unless a future use case requires package-internal events.
+- Use decorators on owned public business APIs where the package dependency is acceptable.
+- Wrap third-party or legacy packages at the application boundary.
 - Use no logger dependency for generic low-level utility packages.
-- Use decorators in application code where the package is already available.
+- Avoid instrumentation inside internal helpers and row-level loops.
 
 Example application-level dependency:
 
@@ -1212,7 +1222,10 @@ For v1, logging failures warn and continue when business code succeeds. If busin
 
 ### Can packages use the SDK directly?
 
-They can, but v1 does not require private packages to import `databricks_event_logger` internally. Instrumentation should happen at the notebook, job, application function, helper, context-manager, or task-wrapper layer.
+Yes, owned domain packages should decorate stable public business APIs when the
+package dependency is acceptable. Third-party, generic, or legacy packages can
+still be wrapped at the notebook, job, application function, helper,
+context-manager, or task-wrapper layer.
 
 ### Should low-level utility packages emit events?
 

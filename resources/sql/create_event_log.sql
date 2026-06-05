@@ -1,5 +1,6 @@
 -- Template DDL for the configured event log table.
 -- The deployment layer is responsible for substituting the table name and managing grants/retention.
+-- Replace ${observability_event_table} before running this file directly.
 -- For higher-volume production deployments, choose layout outside this template based on workload:
 --   - partitioning by event_date can help retention and date filters
 --   - clustering or liquid clustering by event_date, job_id, run_id, or task_key can help dashboards

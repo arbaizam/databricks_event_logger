@@ -1,12 +1,18 @@
 -- Optional dashboard view templates for the configured event log table.
 -- The deployment layer owns substitution, grants, and validation against the
 -- system table schema available in the target workspace.
+-- Replace all ${...} placeholders before running this file directly.
 --
 -- Expected substitutions:
 --   ${observability_event_table}
 --   ${observability_event_log_recent_view}
 --   ${observability_event_log_failures_view}
 --   ${observability_event_log_run_summary_view}
+--   ${observability_event_log_performance_view}
+--   ${observability_event_log_delta_operations_view}
+--   ${observability_event_log_validation_results_view}
+--   ${observability_event_log_metrics_view}
+--   ${observability_event_log_business_process_view}
 
 CREATE OR REPLACE VIEW ${observability_event_log_recent_view} AS
 WITH normalized AS (
@@ -128,6 +134,144 @@ SELECT
   max(CASE WHEN status = 'failed' THEN error_message END) AS sample_error_message
 FROM ${observability_event_log_recent_view}
 GROUP BY workspace_id, coalesce(run_id, correlation_id);
+
+CREATE OR REPLACE VIEW ${observability_event_log_performance_view} AS
+SELECT
+  event_ts,
+  event_date,
+  event_name,
+  event_type,
+  status,
+  severity,
+  duration_ms,
+  app_name,
+  component,
+  environment,
+  job_run_url,
+  job_url,
+  job_id,
+  run_id,
+  task_key,
+  task_run_id,
+  source_table,
+  target_table,
+  row_count,
+  metadata_json,
+  correlation_id,
+  parent_event_id,
+  event_id
+FROM ${observability_event_log_recent_view}
+WHERE duration_ms IS NOT NULL;
+
+CREATE OR REPLACE VIEW ${observability_event_log_delta_operations_view} AS
+SELECT
+  event_ts,
+  event_date,
+  event_name,
+  event_type,
+  status,
+  severity,
+  duration_ms,
+  app_name,
+  component,
+  environment,
+  job_run_url,
+  job_id,
+  run_id,
+  task_key,
+  source_table,
+  target_table,
+  row_count,
+  metadata_json,
+  correlation_id,
+  parent_event_id,
+  event_id
+FROM ${observability_event_log_recent_view}
+WHERE event_type IN ('delta_read', 'delta_write')
+   OR event_name IN ('delta.read', 'delta.write');
+
+CREATE OR REPLACE VIEW ${observability_event_log_validation_results_view} AS
+SELECT
+  event_ts,
+  event_date,
+  event_name,
+  event_type,
+  status,
+  severity,
+  duration_ms,
+  app_name,
+  component,
+  environment,
+  job_run_url,
+  job_id,
+  run_id,
+  task_key,
+  source_table,
+  target_table,
+  row_count,
+  error_class,
+  error_message,
+  metadata_json,
+  correlation_id,
+  parent_event_id,
+  event_id
+FROM ${observability_event_log_recent_view}
+WHERE event_type = 'validation'
+   OR event_name LIKE 'validation.%';
+
+CREATE OR REPLACE VIEW ${observability_event_log_metrics_view} AS
+SELECT
+  event_ts,
+  event_date,
+  event_name,
+  event_type,
+  status,
+  severity,
+  app_name,
+  component,
+  environment,
+  job_run_url,
+  job_id,
+  run_id,
+  task_key,
+  metric_name,
+  metric_value,
+  row_count,
+  metadata_json,
+  correlation_id,
+  parent_event_id,
+  event_id
+FROM ${observability_event_log_recent_view}
+WHERE event_type = 'metric'
+   OR metric_name IS NOT NULL;
+
+CREATE OR REPLACE VIEW ${observability_event_log_business_process_view} AS
+SELECT
+  event_ts,
+  event_date,
+  event_name,
+  event_type,
+  status,
+  severity,
+  duration_ms,
+  app_name,
+  component,
+  environment,
+  job_run_url,
+  job_id,
+  run_id,
+  task_key,
+  source_table,
+  target_table,
+  row_count,
+  error_class,
+  error_message,
+  metadata_json,
+  correlation_id,
+  parent_event_id,
+  event_id
+FROM ${observability_event_log_recent_view}
+WHERE event_type IN ('business_process', 'rules_engine', 'rules_engine_quality');
 
 -- Example only. Verify system table names and columns in the target workspace.
 -- CREATE OR REPLACE VIEW ${observability_event_log_run_enriched_view} AS

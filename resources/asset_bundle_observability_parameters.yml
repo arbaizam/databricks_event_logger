@@ -1,0 +1,22 @@
+# Copy this block into notebook tasks that use databricks-event-logger.
+# The first four parameters are required for normal package bootstrap.
+# The remaining parameters improve context capture and dashboard navigation.
+
+base_parameters:
+  app_name: example_app
+  component: example_task
+  environment: ${bundle.target}
+  observability_event_table: ${var.observability_event_table}
+  workspace_id: "{{workspace.id}}"
+  workspace_url: "{{workspace.url}}"
+  job_id: "{{job.id}}"
+  run_id: "{{job.run_id}}"
+  task_key: "{{task.name}}"
+  # Verify this dynamic value resolves for each task type you use.
+  task_run_id: "{{task.run_id}}"
+  task_attempt_number: "{{task.execution_count}}"
+  job_start_time: "{{job.start_time.iso_datetime}}"
+  job_trigger_type: "{{job.trigger.type}}"
+  notebook_path: "{{task.notebook_path}}"
+  # No universal Databricks dynamic value exists for this; supply manually if useful.
+  # run_as_user_name: service-principal-or-user-name

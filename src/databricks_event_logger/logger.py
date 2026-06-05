@@ -13,7 +13,7 @@ import hashlib
 import inspect
 import traceback
 import warnings
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from contextlib import contextmanager
 from contextvars import ContextVar
 from datetime import datetime
@@ -21,6 +21,11 @@ from functools import wraps
 from typing import Any, TypeVar
 from uuid import uuid4
 
+from databricks_event_logger._widget_utils import (
+    context_from_widgets,
+    widget_value,
+    widget_values,
+)
 from databricks_event_logger.config import EventLoggerConfig
 from databricks_event_logger.context import RuntimeContext, resolve_databricks_context
 from databricks_event_logger.errors import EventLoggerConfigurationError
@@ -38,6 +43,7 @@ from databricks_event_logger.timing import elapsed_ms, monotonic_ms, utc_now
 
 F = TypeVar("F", bound=Callable[..., Any])
 T = TypeVar("T")
+MetadataFactory = Callable[..., Mapping[str, Any] | None]
 
 _default_logger: ContextVar[EventLogger | None] = ContextVar(
     "databricks_event_logger_default",
@@ -68,8 +74,9 @@ class EventLogger:
     context : RuntimeContext | None, default None
         Runtime context to attach to events.
     correlation_id : str | None, default None
-        Correlation identifier shared by emitted events. A UUID is generated
-        when omitted.
+        Correlation identifier shared by emitted events. When omitted, the
+        logger derives a stable value from Databricks task/run context when
+        available and falls back to a UUID outside Databricks.
     event_table : str | None, default None
         Fully qualified event table for Delta-backed usage. Stored in config
         but not used unless a Delta sink is configured.
@@ -122,7 +129,9 @@ class EventLogger:
             event_table=event_table,
         )
         self.context = context or RuntimeContext()
-        self.correlation_id = correlation_id or str(uuid4())
+        self.correlation_id = (
+            correlation_id or _correlation_id_from_context(self.context) or str(uuid4())
+        )
         self.sink: EventSink = sink or MemorySink()
         self.default_metadata = dict(default_metadata or {})
         self.metadata_max_bytes = metadata_max_bytes
@@ -312,7 +321,8 @@ class EventLogger:
         event_name: str,
         *,
         event_type: str = "function",
-        metadata: dict[str, Any] | None = None,
+        metadata: Mapping[str, Any] | None = None,
+        metadata_factory: MetadataFactory | None = None,
     ) -> Callable[[F], F]:
         """
         Decorate a function so success and failure are logged automatically.
@@ -323,8 +333,12 @@ class EventLogger:
             Event emitted when the function finishes.
         event_type : str, default "function"
             Event category.
-        metadata : dict[str, Any] | None, default None
+        metadata : Mapping[str, Any] | None, default None
             Static metadata to attach to the event.
+        metadata_factory : Callable[..., Mapping[str, Any] | None] | None, default None
+            Optional callable evaluated at function-call time with the wrapped
+            function's positional and keyword arguments. Returned keys are
+            merged into ``metadata`` and win on key conflicts.
 
         Returns
         -------
@@ -341,6 +355,9 @@ class EventLogger:
                     lambda: func(*args, **kwargs),
                     event_type=event_type,
                     metadata=metadata,
+                    metadata_factory=metadata_factory,
+                    factory_args=args,
+                    factory_kwargs=kwargs,
                 )
 
             return wrapper  # type: ignore[return-value]
@@ -474,7 +491,10 @@ class EventLogger:
         func: Callable[[], T],
         *,
         event_type: str,
-        metadata: dict[str, Any] | None,
+        metadata: Mapping[str, Any] | None,
+        metadata_factory: MetadataFactory | None = None,
+        factory_args: tuple[Any, ...] = (),
+        factory_kwargs: Mapping[str, Any] | None = None,
     ) -> T:
         """
         Execute one callable and emit success or failure.
@@ -484,6 +504,13 @@ class EventLogger:
         event_id = str(uuid4())
         parent_event_id = _current_event_id.get()
         token = _current_event_id.set(event_id)
+        resolved_metadata = _resolve_observed_metadata(
+            metadata,
+            metadata_factory,
+            event_name=event_name,
+            factory_args=factory_args,
+            factory_kwargs=factory_kwargs,
+        )
         try:
             result = func()
         except Exception as exc:
@@ -492,7 +519,7 @@ class EventLogger:
                 event_name,
                 exc,
                 event_type=event_type,
-                metadata=metadata,
+                metadata=resolved_metadata,
                 start_ts=start_ts,
                 end_ts=end_ts,
                 duration_ms=elapsed_ms(start_ms),
@@ -506,7 +533,7 @@ class EventLogger:
                 event_name,
                 event_type=event_type,
                 status="success",
-                metadata=metadata,
+                metadata=resolved_metadata,
                 start_ts=start_ts,
                 end_ts=end_ts,
                 duration_ms=elapsed_ms(start_ms),
@@ -737,22 +764,22 @@ class NotebookObserver:
         EventLogger
             Configured default logger.
         """
-        widget_values = _widget_values(dbutils)
+        captured_widget_values = widget_values(dbutils)
         resolved_context = context or resolve_databricks_context(
             dbutils=dbutils,
             spark=spark,
-            fallback=_context_from_widgets(widget_values),
+            fallback=context_from_widgets(captured_widget_values),
         )
         resolved_sink = sink
         if resolved_sink is None:
-            if event_table and spark is None:
+            if event_table and spark is None and not require_persistence:
                 warnings.warn(
                     "observability_event_table was provided but no Spark session was supplied. "
                     "Events will be stored in MemorySink and will not be persisted.",
                     RuntimeWarning,
                     stacklevel=2,
                 )
-            elif spark is not None and not event_table:
+            elif spark is not None and not event_table and not require_persistence:
                 warnings.warn(
                     "A Spark session was supplied but observability_event_table "
                     "is missing or blank. Events will be stored in MemorySink "
@@ -861,36 +888,39 @@ class NotebookObserver:
             Configured default logger.
         """
         resolved_dbutils = dbutils
+        frame_inspected_names: list[str] = []
         if resolved_dbutils is None:
             resolved_dbutils = _caller_global("dbutils")
             if resolved_dbutils is not None:
-                warnings.warn(
-                    "observe_notebook.from_widgets() found dbutils through frame inspection. "
-                    "Pass dbutils explicitly in production notebooks.",
-                    RuntimeWarning,
-                    stacklevel=2,
-                )
+                frame_inspected_names.append("dbutils")
         resolved_spark = spark
         if resolved_spark is None:
             resolved_spark = _caller_global("spark")
             if resolved_spark is not None:
-                warnings.warn(
-                    "observe_notebook.from_widgets() found spark through frame inspection. "
-                    "Pass spark explicitly in production notebooks.",
-                    RuntimeWarning,
-                    stacklevel=2,
-                )
-        widget_values = _widget_values(resolved_dbutils)
+                frame_inspected_names.append("spark")
+        if frame_inspected_names:
+            inspected = _join_names(frame_inspected_names)
+            warnings.warn(
+                "observe_notebook.from_widgets() found "
+                f"{inspected} through frame inspection. Pass {inspected} "
+                "explicitly in production notebooks.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+        captured_widget_values = widget_values(resolved_dbutils)
         context = resolve_databricks_context(
             dbutils=resolved_dbutils,
             spark=resolved_spark,
-            fallback=_context_from_widgets(widget_values),
+            fallback=context_from_widgets(captured_widget_values),
         )
         return self(
-            app_name=_widget_value(widget_values, "app_name"),
-            component=_widget_value(widget_values, "component"),
-            environment=_widget_value(widget_values, "environment"),
-            event_table=_widget_value(widget_values, "observability_event_table"),
+            app_name=widget_value(captured_widget_values, "app_name"),
+            component=widget_value(captured_widget_values, "component"),
+            environment=widget_value(captured_widget_values, "environment"),
+            event_table=widget_value(
+                captured_widget_values,
+                "observability_event_table",
+            ),
             sink=sink,
             spark=resolved_spark,
             dbutils=resolved_dbutils,
@@ -903,6 +933,42 @@ class NotebookObserver:
             error_message_max_chars=error_message_max_chars,
             redact_keys=redact_keys,
             strict_logging=strict_logging,
+            max_events_warning_threshold=max_events_warning_threshold,
+        )
+
+    def production_from_widgets(
+        self,
+        *,
+        dbutils: Any | None = None,
+        spark: Any | None = None,
+        sink: EventSink | None = None,
+        default_metadata: dict[str, Any] | None = None,
+        metadata_max_bytes: int | None = DEFAULT_METADATA_MAX_BYTES,
+        metadata_string_max_chars: int | None = DEFAULT_METADATA_STRING_MAX_CHARS,
+        error_message_max_chars: int | None = 2000,
+        redact_keys: tuple[str, ...] = DEFAULT_REDACT_KEYS,
+        max_events_warning_threshold: int | None = 100,
+    ) -> EventLogger:
+        """
+        Initialize production observability from standard Databricks widgets.
+
+        This is a convenience preset for the recommended production controls:
+        persistent Delta logging is required, the sink is validated before
+        startup events are emitted, and sink failures on successful business
+        paths are treated as errors.
+        """
+        return self.from_widgets(
+            dbutils=dbutils,
+            spark=spark,
+            sink=sink,
+            require_persistence=True,
+            validate_sink=True,
+            default_metadata=default_metadata,
+            metadata_max_bytes=metadata_max_bytes,
+            metadata_string_max_chars=metadata_string_max_chars,
+            error_message_max_chars=error_message_max_chars,
+            redact_keys=redact_keys,
+            strict_logging=True,
             max_events_warning_threshold=max_events_warning_threshold,
         )
 
@@ -919,6 +985,87 @@ def _stack_trace_hash(exc: BaseException) -> str:
     """
     trace_text = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
     return hashlib.sha256(trace_text.encode("utf-8")).hexdigest()
+
+
+def _resolve_observed_metadata(
+    metadata: Mapping[str, Any] | None,
+    metadata_factory: MetadataFactory | None,
+    *,
+    event_name: str,
+    factory_args: tuple[Any, ...],
+    factory_kwargs: Mapping[str, Any] | None,
+) -> dict[str, Any] | None:
+    """
+    Resolve static and call-time metadata for observed functions.
+    """
+    resolved = _copy_metadata(metadata)
+    if metadata_factory is None:
+        return resolved
+    try:
+        factory_metadata = metadata_factory(*factory_args, **dict(factory_kwargs or {}))
+        factory_metadata = dict(factory_metadata or {})
+    except Exception as exc:
+        resolved = _metadata_with_factory_error(resolved, exc)
+        warnings.warn(
+            f"metadata_factory for {event_name!r} raised "
+            f"{type(exc).__name__}: {exc}. Static metadata will be used.",
+            RuntimeWarning,
+            stacklevel=3,
+        )
+        return resolved
+    if factory_metadata:
+        if resolved is None:
+            resolved = {}
+        resolved.update(factory_metadata)
+    return resolved
+
+
+def _copy_metadata(metadata: Mapping[str, Any] | None) -> dict[str, Any] | None:
+    """
+    Return a mutable metadata copy while preserving empty metadata as ``None``.
+    """
+    if not metadata:
+        return None
+    return dict(metadata)
+
+
+def _metadata_with_factory_error(
+    metadata: dict[str, Any] | None,
+    exc: BaseException,
+) -> dict[str, Any]:
+    """
+    Return metadata annotated with a non-blocking metadata factory failure.
+    """
+    resolved = dict(metadata or {})
+    resolved.update(
+        {
+            "metadata_factory_error": True,
+            "metadata_factory_error_class": type(exc).__name__,
+            "metadata_factory_error_message": str(exc),
+        }
+    )
+    return resolved
+
+
+def _correlation_id_from_context(context: RuntimeContext) -> str | None:
+    """
+    Return a stable task/run correlation id from Databricks context.
+
+    The default is task-run correlation: ``task_run_id`` when Databricks
+    supplies it, otherwise ``run_id:task_key[:attempt]`` or ``run_id``. Pass an
+    explicit ``correlation_id`` when a workflow needs a single ID shared across
+    multiple tasks or retries.
+    """
+    if context.task_run_id:
+        return context.task_run_id
+    if context.run_id and context.task_key:
+        parts = [context.run_id, context.task_key]
+        if context.task_attempt_number:
+            parts.append(context.task_attempt_number)
+        return ":".join(parts)
+    if context.run_id:
+        return context.run_id
+    return None
 
 
 def _job_url(context: RuntimeContext) -> str | None:
@@ -953,97 +1100,13 @@ def _workspace_url_with_scheme(workspace_url: str | None) -> str | None:
     return f"https://{normalized}"
 
 
-def _widget_values(dbutils: Any | None) -> dict[str, str]:
+def _join_names(names: list[str]) -> str:
     """
-    Return all visible Databricks widget values.
+    Join names for compact warning text.
     """
-    if dbutils is None:
-        return {}
-    values: dict[str, str] = {}
-    try:
-        raw_values = dbutils.widgets.getAll()
-    except Exception:
-        raw_values = {}
-    try:
-        items = raw_values.items()
-    except Exception:
-        items = ()
-    for key, value in items:
-        if text := _string_or_none(value):
-            values[str(key)] = text
-    for name in _KNOWN_WIDGET_NAMES:
-        if name not in values and (value := _legacy_widget_value(dbutils, name)):
-            values[name] = value
-    return values
-
-
-def _widget_value(values: dict[str, str], name: str) -> str | None:
-    """
-    Read one Databricks widget value from a captured widget mapping.
-    """
-    return values.get(name)
-
-
-def _context_from_widgets(values: dict[str, str]) -> dict[str, str | None]:
-    """
-    Return optional runtime context fallback values from Databricks widgets.
-    """
-    context_values: dict[str, str] = {}
-    for field, widget_names in _WIDGET_CONTEXT_KEY_MAP.items():
-        for widget_name in widget_names:
-            if value := values.get(widget_name):
-                context_values[field] = value
-                break
-    return context_values
-
-
-def _string_or_none(value: Any) -> str | None:
-    """
-    Convert a widget value to ``str`` while preserving missing values.
-    """
-    if value is None:
-        return None
-    text = str(value).strip()
-    return text or None
-
-
-_WIDGET_CONTEXT_KEY_MAP = {
-    "workspace_id": ("workspace_id",),
-    "workspace_url": ("workspace_url",),
-    "cluster_id": ("cluster_id",),
-    "job_id": ("job_id",),
-    "run_id": ("run_id", "job_run_id"),
-    "task_key": ("task_key", "task_name"),
-    "task_run_id": ("task_run_id",),
-    "task_attempt_number": ("task_attempt_number", "task_execution_count"),
-    "job_start_time": ("job_start_time",),
-    "job_trigger_type": ("job_trigger_type",),
-    "notebook_path": ("notebook_path",),
-    "user_name": ("user_name",),
-    "run_as_user_name": ("run_as_user_name",),
-}
-
-_KNOWN_WIDGET_NAMES = (
-    "app_name",
-    "component",
-    "environment",
-    "observability_event_table",
-    *tuple(name for names in _WIDGET_CONTEXT_KEY_MAP.values() for name in names),
-)
-
-
-def _legacy_widget_value(dbutils: Any | None, name: str) -> str | None:
-    """
-    Read one Databricks widget value using the direct widget API.
-    """
-    if dbutils is None:
-        return None
-    try:
-        value = dbutils.widgets.get(name)
-    except Exception:
-        return None
-    text = str(value).strip()
-    return text or None
+    if len(names) == 1:
+        return names[0]
+    return f"{', '.join(names[:-1])} and {names[-1]}"
 
 
 def _caller_global(name: str, *, max_depth: int = 10) -> Any | None:

@@ -115,7 +115,6 @@ class DeltaSink:
         dataframe = self.spark.createDataFrame([row], schema=_event_schema())
         dataframe.createOrReplaceTempView(view_name)
 
-        insert_error: Exception | None = None
         try:
             self.spark.sql(
                 f"""
@@ -124,18 +123,13 @@ class DeltaSink:
                 FROM {view_name}
                 """
             )
-        except Exception as exc:
-            insert_error = exc
-            raise
         finally:
             try:
                 self.spark.sql(f"DROP VIEW IF EXISTS {view_name}")
             except Exception as cleanup_exc:
-                if insert_error is None:
-                    raise
                 warnings.warn(
-                    "DeltaSink failed to clean up staging view after an insert "
-                    f"failure; preserving the original insert error: {cleanup_exc}",
+                    "DeltaSink failed to clean up staging view "
+                    f"{view_name!r}: {cleanup_exc}",
                     RuntimeWarning,
                     stacklevel=2,
                 )

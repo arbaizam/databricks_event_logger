@@ -3,7 +3,18 @@ from contextvars import Context
 
 import pytest
 
-from databricks_event_logger import EventLogger, get_default_logger, observe_notebook, observed
+from databricks_event_logger import (
+    CommonEvent,
+    EventLogger,
+    EventSeverity,
+    EventStatus,
+    EventType,
+    assert_observability_ready,
+    check_observability_ready,
+    get_default_logger,
+    observe_notebook,
+    observed,
+)
 from databricks_event_logger.context import RuntimeContext
 from databricks_event_logger.errors import EventLoggerConfigurationError
 from databricks_event_logger.serialization import deserialize_metadata
@@ -34,6 +45,78 @@ def test_record_event_stamps_config_context_and_correlation():
     assert event.correlation_id == "corr-1"
 
 
+def test_event_constants_are_accepted_as_event_fields():
+    """
+    What: Records an event using public event constants.
+    Why: Constants should reduce caller typos without changing persisted values.
+    Fails when: String enum constants leak enum names into event rows.
+    """
+    sink = MemorySink()
+    logger = EventLogger(sink=sink)
+
+    event = logger.record_event(
+        CommonEvent.DELTA_WRITE,
+        event_type=EventType.DELTA_WRITE,
+        status=EventStatus.SUCCESS,
+        severity=EventSeverity.INFO,
+    )
+
+    assert event.event_name == "delta.write"
+    assert event.event_type == "delta_write"
+    assert event.status == "success"
+    assert event.severity == "info"
+
+
+def test_logger_derives_correlation_id_from_task_context():
+    """
+    What: Uses Databricks task context for the default correlation id.
+    Why: Events from the same task run should have a stable join key.
+    Fails when: Logger always falls back to a random UUID in Databricks jobs.
+    """
+    logger = EventLogger(
+        sink=MemorySink(),
+        context=RuntimeContext(
+            run_id="run-1",
+            task_key="publish",
+            task_attempt_number="2",
+        ),
+    )
+
+    assert logger.correlation_id == "run-1:publish:2"
+
+
+def test_logger_prefers_task_run_id_for_default_correlation_id():
+    """
+    What: Uses task_run_id when Databricks supplies it.
+    Why: task_run_id is the most precise task-run correlation identifier.
+    Fails when: A less specific run id is used despite task_run_id being known.
+    """
+    logger = EventLogger(
+        sink=MemorySink(),
+        context=RuntimeContext(
+            run_id="run-1",
+            task_key="publish",
+            task_run_id="task-run-1",
+        ),
+    )
+
+    assert logger.correlation_id == "task-run-1"
+
+
+def test_logger_uses_run_id_when_no_task_context_is_available():
+    """
+    What: Falls back to run_id when task-level Databricks fields are unavailable.
+    Why: Single-task jobs and some execution modes still need stable run correlation.
+    Fails when: The run_id-only branch falls back to a random UUID.
+    """
+    logger = EventLogger(
+        sink=MemorySink(),
+        context=RuntimeContext(run_id="run-1"),
+    )
+
+    assert logger.correlation_id == "run-1"
+
+
 def test_logged_event_records_success_and_return_value():
     """
     What: Decorates a successful function and returns the original result.
@@ -51,6 +134,73 @@ def test_logged_event_records_success_and_return_value():
     assert sink.events[-1].event_name == "reporting.build_positions"
     assert sink.events[-1].status == "success"
     assert sink.events[-1].duration_ms is not None
+
+
+def test_logged_event_metadata_factory_uses_call_arguments():
+    """
+    What: Builds decorator metadata from runtime function arguments.
+    Why: Package-level instrumentation needs metadata such as ruleset/as_of_date at call time.
+    Fails when: Decorators only support import-time static metadata.
+    """
+    sink = MemorySink()
+    logger = EventLogger(sink=sink)
+
+    @logger.logged_event(
+        "reporting.apply_rules",
+        event_type="business_process",
+        metadata={"source": "decorator"},
+        metadata_factory=lambda df, *, ruleset, as_of_date: {
+            "df": df,
+            "ruleset": ruleset,
+            "as_of_date": as_of_date,
+        },
+    )
+    def apply_rules(df, *, ruleset: str, as_of_date: str):
+        return "ok"
+
+    assert apply_rules("positions", ruleset="MVE", as_of_date="2026-06-30") == "ok"
+    metadata = deserialize_metadata(sink.events[-1].metadata_json)
+
+    assert metadata == {
+        "as_of_date": "2026-06-30",
+        "df": "positions",
+        "ruleset": "MVE",
+        "source": "decorator",
+    }
+
+
+def test_logged_event_metadata_factory_failure_does_not_block_function():
+    """
+    What: Continues running business code when metadata_factory raises.
+    Why: Optional call-time metadata should not become adoption-breaking business logic.
+    Fails when: A bad metadata_factory prevents the wrapped function from running.
+    """
+    sink = MemorySink()
+    logger = EventLogger(sink=sink)
+    calls = []
+
+    def broken_metadata_factory(value):
+        raise KeyError(f"missing-{value}")
+
+    @logger.logged_event(
+        "reporting.apply_rules",
+        metadata={"source": "decorator"},
+        metadata_factory=broken_metadata_factory,
+    )
+    def apply_rules(value):
+        calls.append(value)
+        return "ok"
+
+    with pytest.warns(RuntimeWarning, match="metadata_factory"):
+        assert apply_rules("positions") == "ok"
+    metadata = deserialize_metadata(sink.events[-1].metadata_json)
+
+    assert calls == ["positions"]
+    assert sink.events[-1].status == "success"
+    assert metadata["source"] == "decorator"
+    assert metadata["metadata_factory_error"] is True
+    assert metadata["metadata_factory_error_class"] == "KeyError"
+    assert "missing-positions" in metadata["metadata_factory_error_message"]
 
 
 def test_logged_event_records_failure_and_reraises_original_exception():
@@ -74,6 +224,36 @@ def test_logged_event_records_failure_and_reraises_original_exception():
     assert sink.events[-1].error_class == "ValueError"
     assert sink.events[-1].error_message == "boom"
     assert sink.events[-1].stack_trace_hash
+
+
+def test_logged_event_metadata_factory_failure_preserves_business_exception():
+    """
+    What: Keeps the business failure when metadata_factory and business code both fail.
+    Why: Databricks task status should be driven by the original business exception.
+    Fails when: Factory exceptions mask the exception raised by the wrapped function.
+    """
+    sink = MemorySink()
+    logger = EventLogger(sink=sink)
+
+    def broken_metadata_factory():
+        raise RuntimeError("metadata failed")
+
+    @logger.logged_event(
+        "reporting.fail",
+        metadata_factory=broken_metadata_factory,
+    )
+    def fail():
+        raise ValueError("business failed")
+
+    with pytest.warns(RuntimeWarning, match="metadata_factory"):
+        with pytest.raises(ValueError, match="business failed"):
+            fail()
+    metadata = deserialize_metadata(sink.events[-1].metadata_json)
+
+    assert sink.events[-1].status == "failed"
+    assert sink.events[-1].error_class == "ValueError"
+    assert metadata["metadata_factory_error"] is True
+    assert metadata["metadata_factory_error_class"] == "RuntimeError"
 
 
 def test_context_manager_records_success_for_custom_block():
@@ -228,6 +408,33 @@ def test_observed_decorator_uses_default_logger_at_call_time():
     Context().run(run)
 
 
+def test_observed_metadata_factory_uses_default_logger_at_call_time():
+    """
+    What: Uses metadata_factory with the module-level default logger decorator.
+    Why: Owned packages should be able to decorate public APIs without inner wrappers.
+    Fails when: @observed cannot compute metadata from call arguments.
+    """
+    def run():
+        sink = MemorySink()
+        observe_notebook(app_name="app", component="component", environment="dev", sink=sink)
+
+        @observed(
+            "reporting.default_logger.dynamic",
+            metadata_factory=lambda value, *, batch_id: {
+                "value": value,
+                "batch_id": batch_id,
+            },
+        )
+        def work(value, *, batch_id):
+            return "ok"
+
+        assert work("input", batch_id="batch-1") == "ok"
+        metadata = deserialize_metadata(sink.events[-1].metadata_json)
+        assert metadata == {"batch_id": "batch-1", "value": "input"}
+
+    Context().run(run)
+
+
 def test_observe_notebook_from_widgets_uses_optional_context_widgets():
     """
     What: Uses optional widget values as runtime context fallbacks.
@@ -363,9 +570,9 @@ def test_observe_notebook_warns_when_spark_has_no_event_table():
 
 def test_observe_notebook_from_widgets_warns_on_frame_inspection():
     """
-    What: Warns when dbutils is discovered through caller-frame inspection.
+    What: Warns once when globals are discovered through caller-frame inspection.
     Why: Production notebooks should pass dbutils and spark explicitly.
-    Fails when: Fragile implicit lookup remains invisible to developers.
+    Fails when: Fragile implicit lookup remains invisible or emits noisy duplicate warnings.
     """
     def run():
         dbutils = FakeDbutils(
@@ -375,13 +582,18 @@ def test_observe_notebook_from_widgets_warns_on_frame_inspection():
                 "environment": "dev",
             }
         )
+        spark = object()
         sink = MemorySink()
 
-        with pytest.warns(RuntimeWarning, match="frame inspection"):
+        with warnings.catch_warnings(record=True) as warning_records:
+            warnings.simplefilter("always")
             logger = observe_notebook.from_widgets(sink=sink)
 
         assert logger.config.app_name == "app"
         assert dbutils.widgets.get("app_name") == "app"
+        assert spark is not None
+        assert len(warning_records) == 1
+        assert "dbutils and spark" in str(warning_records[0].message)
 
     Context().run(run)
 
@@ -538,13 +750,101 @@ def test_observe_notebook_requires_persistence_when_requested():
     Why: Production jobs should not silently fall back to MemorySink.
     Fails when: require_persistence=True still allows in-memory events.
     """
-    with pytest.raises(EventLoggerConfigurationError, match="Persistent event logging"):
-        observe_notebook(
-            app_name="app",
-            component="component",
-            environment="dev",
-            require_persistence=True,
-        )
+    with warnings.catch_warnings(record=True) as warning_records:
+        warnings.simplefilter("always")
+        with pytest.raises(EventLoggerConfigurationError, match="Persistent event logging"):
+            observe_notebook(
+                app_name="app",
+                component="component",
+                environment="dev",
+                event_table="catalog.schema.event_log",
+                require_persistence=True,
+            )
+
+    assert not warning_records
+
+
+def test_production_from_widgets_enables_production_controls():
+    """
+    What: Applies the production bootstrap preset from widgets.
+    Why: Production jobs should not require developers to remember multiple flags.
+    Fails when: production_from_widgets does not fail fast or validate the sink.
+    """
+    pytest.importorskip("pyspark")
+    dbutils = FakeDbutils(
+        {
+            "app_name": "app",
+            "component": "component",
+            "environment": "prod",
+            "observability_event_table": "catalog.schema.event_log",
+        }
+    )
+    spark = FakeSpark(describe_columns=FULL_EVENT_COLUMNS)
+
+    logger = observe_notebook.production_from_widgets(dbutils=dbutils, spark=spark)
+    metadata = deserialize_metadata(spark.data[0]["metadata_json"])
+
+    assert type(logger.sink).__name__ == "DeltaSink"
+    assert logger.strict_logging is True
+    assert metadata["require_persistence"] is True
+    assert metadata["validate_sink"] is True
+    assert metadata["strict_logging"] is True
+    assert spark.sql_calls[0].startswith("DESCRIBE TABLE catalog.schema.event_log")
+    assert spark.sql_calls[1].startswith("INSERT INTO catalog.schema.event_log")
+
+
+def test_check_observability_ready_reports_missing_persistence():
+    """
+    What: Reports readiness issues without configuring the default logger.
+    Why: Setup diagnostics should be available before emitting events.
+    Fails when: Missing Spark/table configuration is not visible.
+    """
+    report = check_observability_ready(require_persistence=True, validate_sink=False)
+
+    assert report.ready is False
+    assert report.sink_type == "MemorySink"
+    assert "Persistent event logging is required" in report.issues[0]
+
+
+def test_assert_observability_ready_returns_report_when_ready():
+    """
+    What: Returns a readiness report when required production inputs are present.
+    Why: Production notebooks need a compact preflight check.
+    Fails when: The assert helper emits events or rejects valid basic configuration.
+    """
+    dbutils = FakeDbutils({"observability_event_table": "catalog.schema.event_log"})
+
+    report = assert_observability_ready(
+        dbutils=dbutils,
+        spark=object(),
+        require_persistence=True,
+        validate_sink=False,
+    )
+
+    assert report.ready is True
+    assert report.sink_type == "DeltaSink"
+    assert report.event_table == "catalog.schema.event_log"
+
+
+def test_check_observability_ready_reports_delta_validation_failure():
+    """
+    What: Reports DeltaSink schema validation failures without emitting events.
+    Why: Preflight checks should catch bad event table deployment before bootstrap.
+    Fails when: Readiness diagnostics ignore a malformed event log table.
+    """
+    dbutils = FakeDbutils({"observability_event_table": "catalog.schema.event_log"})
+    spark = FakeSpark(describe_columns=["event_name"])
+
+    report = check_observability_ready(
+        dbutils=dbutils,
+        spark=spark,
+        require_persistence=True,
+        validate_sink=True,
+    )
+
+    assert report.ready is False
+    assert report.sink_type == "DeltaSink"
+    assert "missing required columns" in report.issues[0]
 
 
 class FakeDbutils:
@@ -566,22 +866,34 @@ class FakeWidgets:
 
 
 class FakeSpark:
-    def __init__(self):
+    def __init__(self, describe_columns=None):
         self.data = None
         self.dataframe = FakeDataFrame()
         self.sql_calls = []
+        self.describe_columns = describe_columns
 
     def createDataFrame(self, data, schema=None):  # noqa: N802 - Spark API casing.
         self.data = data
         return self.dataframe
 
     def sql(self, query):
-        self.sql_calls.append(" ".join(query.split()))
+        normalized = " ".join(query.split())
+        self.sql_calls.append(normalized)
+        if normalized.startswith("DESCRIBE TABLE"):
+            return FakeDescribeResult(self.describe_columns or [])
 
 
 class FakeDataFrame:
     def createOrReplaceTempView(self, name):  # noqa: N802 - Spark API casing.
         self.view_name = name
+
+
+class FakeDescribeResult:
+    def __init__(self, columns):
+        self.columns = columns
+
+    def collect(self):
+        return [{"col_name": column} for column in self.columns]
 
 
 class FailingSink:
@@ -593,3 +905,46 @@ class FailingSink:
 
     def close(self):
         pass
+
+
+FULL_EVENT_COLUMNS = (
+    "event_name",
+    "event_type",
+    "status",
+    "event_id",
+    "correlation_id",
+    "parent_event_id",
+    "event_ts",
+    "event_date",
+    "start_ts",
+    "end_ts",
+    "duration_ms",
+    "severity",
+    "app_name",
+    "component",
+    "environment",
+    "sdk_version",
+    "workspace_id",
+    "workspace_url",
+    "cluster_id",
+    "job_id",
+    "run_id",
+    "task_key",
+    "task_run_id",
+    "task_attempt_number",
+    "job_start_time",
+    "job_trigger_type",
+    "notebook_path",
+    "user_name",
+    "run_as_user_name",
+    "source_table",
+    "target_table",
+    "row_count",
+    "metric_name",
+    "metric_value",
+    "error_class",
+    "error_message",
+    "stack_trace_hash",
+    "metadata_json",
+    "created_at",
+)

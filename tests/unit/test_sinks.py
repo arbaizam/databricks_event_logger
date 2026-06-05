@@ -117,6 +117,20 @@ def test_delta_sink_validate_accepts_expected_columns():
     assert spark.sql_calls == ["DESCRIBE TABLE catalog.schema.event_log"]
 
 
+def test_delta_sink_validate_accepts_extra_columns():
+    """
+    What: Accepts a described table that contains required columns plus extras.
+    Why: Platform teams may add future or governance columns without breaking bootstrap.
+    Fails when: validate_sink=True rejects compatible event tables with extra columns.
+    """
+    spark = _DescribeSpark(columns=[*EVENT_COLUMNS, "future_column"])
+    sink = DeltaSink(spark=spark, table_name="catalog.schema.event_log")
+
+    sink.validate()
+
+    assert spark.sql_calls == ["DESCRIBE TABLE catalog.schema.event_log"]
+
+
 def test_delta_sink_preserves_insert_error_when_cleanup_fails():
     """
     What: Keeps the SQL INSERT exception when temp-view cleanup also fails.
@@ -130,6 +144,23 @@ def test_delta_sink_preserves_insert_error_when_cleanup_fails():
     with pytest.warns(RuntimeWarning, match="clean up staging view"):
         with pytest.raises(RuntimeError, match="insert failed"):
             sink.emit(EventRecord("reporting.delta_write"))
+
+
+def test_delta_sink_warns_when_cleanup_fails_after_successful_insert():
+    """
+    What: Treats temp-view cleanup failure as non-fatal after a successful insert.
+    Why: Successful event persistence should not fail strict production jobs on cleanup.
+    Fails when: DROP VIEW errors override a completed INSERT.
+    """
+    pytest.importorskip("pyspark")
+    spark = _CleanupFailSpark()
+    sink = DeltaSink(spark=spark, table_name="catalog.schema.event_log")
+
+    with pytest.warns(RuntimeWarning, match="clean up staging view"):
+        sink.emit(EventRecord("reporting.delta_write"))
+
+    assert spark.sql_calls[0].startswith("INSERT INTO catalog.schema.event_log")
+    assert spark.sql_calls[1].startswith("DROP VIEW IF EXISTS")
 
 
 def test_event_columns_match_create_event_log_ddl():
@@ -235,5 +266,20 @@ class _InsertAndCleanupFailSpark(_FakeSpark):
         self.sql_calls.append(normalized)
         if normalized.startswith("INSERT INTO"):
             raise RuntimeError("insert failed")
+        if normalized.startswith("DROP VIEW"):
+            raise RuntimeError("drop failed")
+
+
+class _CleanupFailSpark(_FakeSpark):
+    """
+    Spark test double that inserts successfully but fails temp-view cleanup.
+    """
+
+    def sql(self, query: str) -> None:
+        """
+        Raise only for cleanup SQL.
+        """
+        normalized = " ".join(query.split())
+        self.sql_calls.append(normalized)
         if normalized.startswith("DROP VIEW"):
             raise RuntimeError("drop failed")

@@ -1,4 +1,57 @@
-# Placeholder resource file included by databricks.yaml.
-# Add Databricks jobs, SQL tasks, or dashboards here as implementation proceeds.
+# Shared observability variables for Asset Bundles that use databricks-event-logger.
+#
+# Include this file from databricks.yaml, then pass the variables below into
+# notebook task base_parameters. The Python package reads those parameters with
+# observe_notebook.from_widgets(dbutils=dbutils, spark=spark).
+
+variables:
+  observability_catalog:
+    description: >
+      Catalog that owns observability objects. DeltaSink V1 accepts only simple
+      identifiers made from letters, numbers, and underscores. If bundle.target
+      contains hyphens or other special characters, override this value.
+    default: ${bundle.target}_observability
+
+  observability_schema:
+    description: >
+      Schema that owns observability objects. Use letters, numbers, and
+      underscores only.
+    default: observability
+
+  observability_event_table:
+    description: Fully qualified event log table.
+    default: ${var.observability_catalog}.${var.observability_schema}.event_log
+
+  observability_event_log_recent_view:
+    description: Fully qualified recent-events view.
+    default: ${var.observability_catalog}.${var.observability_schema}.v_event_log_recent
+
+  observability_event_log_failures_view:
+    description: Fully qualified failures view.
+    default: ${var.observability_catalog}.${var.observability_schema}.v_event_log_failures
+
+  observability_event_log_run_summary_view:
+    description: Fully qualified run-summary view.
+    default: ${var.observability_catalog}.${var.observability_schema}.v_event_log_run_summary
+
+  observability_event_log_performance_view:
+    description: Fully qualified event-performance view.
+    default: ${var.observability_catalog}.${var.observability_schema}.v_event_log_performance
+
+  observability_event_log_delta_operations_view:
+    description: Fully qualified Delta operation view.
+    default: ${var.observability_catalog}.${var.observability_schema}.v_event_log_delta_operations
+
+  observability_event_log_validation_results_view:
+    description: Fully qualified validation-results view.
+    default: ${var.observability_catalog}.${var.observability_schema}.v_event_log_validation_results
+
+  observability_event_log_metrics_view:
+    description: Fully qualified metrics view.
+    default: ${var.observability_catalog}.${var.observability_schema}.v_event_log_metrics
+
+  observability_event_log_business_process_view:
+    description: Fully qualified business-process view.
+    default: ${var.observability_catalog}.${var.observability_schema}.v_event_log_business_process
 
 resources: {}
