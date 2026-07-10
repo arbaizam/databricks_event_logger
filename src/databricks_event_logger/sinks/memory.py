@@ -35,21 +35,3 @@ class MemorySink:
             Event to append.
         """
         self.events.append(event)
-
-    def flush(self) -> None:
-        """
-        Flush pending events.
-
-        Notes
-        -----
-        Memory persistence is immediate, so this is a no-op.
-        """
-
-    def close(self) -> None:
-        """
-        Close the sink.
-
-        Notes
-        -----
-        The memory sink does not own external resources.
-        """

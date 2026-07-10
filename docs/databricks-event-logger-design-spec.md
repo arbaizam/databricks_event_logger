@@ -92,7 +92,7 @@ CI / Asset Bundle Build
   - Keeps artifact construction outside runtime code
 
 Databricks Job / Task / Notebook Runtime
-  - Calls observe_notebook.from_widgets() once
+  - Calls observe_notebook(spark=spark, dbutils=dbutils, ...) once
   - Uses Spark helper APIs for common operations
   - Uses decorators, context managers, and task wrappers where appropriate
 
@@ -106,7 +106,7 @@ databricks_event_logger SDK
 
 Sinks
   - MemorySink for tests
-  - ConsoleSink for local debugging
+  - ConsoleSink as the zero-configuration default
   - DeltaSink for Databricks persistence
 
 Delta Observability Table
@@ -285,26 +285,26 @@ from databricks_event_logger.spark import (
 Notebook or job entry point:
 
 ```python
-from databricks_event_logger import observe_notebook
+from databricks_event_logger import DeltaSink, observe_notebook
 
-observe_notebook(
+event_table = dbutils.widgets.get("observability_event_table").strip()
+sink = DeltaSink(spark=spark, table_name=event_table)
+sink.validate()
+
+logger = observe_notebook(
+    spark=spark,
+    dbutils=dbutils,
     app_name=dbutils.widgets.get("app_name"),
     component=dbutils.widgets.get("component"),
     environment=dbutils.widgets.get("environment"),
-    event_table=dbutils.widgets.get("observability_event_table"),
+    correlation_id=dbutils.widgets.get("correlation_id").strip() or None,
+    sink=sink,
 )
-```
-
-Convenience API:
-
-```python
-from databricks_event_logger import observe_notebook
-
-observe_notebook.from_widgets()
 ```
 
 `observe_notebook` must:
 
+- Require explicit `spark` and `dbutils` dependencies.
 - Create an `EventLogger`.
 - Resolve Databricks context where available.
 - Set the logger as the default logger.
@@ -419,12 +419,12 @@ from databricks_event_logger import observe_notebook
 
 
 def main():
-    positions = read_table("catalog.bronze.co_positions")
+    positions = read_table("catalog.bronze.co_positions", spark=spark)
     mapped = apply_rules(positions, ruleset="MVE_DOE_POSITION_MAPPING")
     write_delta(mapped, "catalog.silver.positions_daily", mode="overwrite")
 
 
-logger = observe_notebook.from_widgets()
+logger = observe_notebook(spark=spark, dbutils=dbutils)
 logger.run_task("reporting.positions_daily", main)
 ```
 
@@ -463,6 +463,7 @@ from databricks_event_logger.spark import read_table
 
 positions = read_table(
     "catalog.bronze.co_positions",
+    spark=spark,
     as_of_date=as_of_date,
 )
 ```
@@ -513,7 +514,11 @@ Row counts should not be computed automatically by default because `DataFrame.co
 ```python
 from databricks_event_logger.spark import run_sql
 
-run_sql("OPTIMIZE catalog.silver.positions_daily", maintenance_action="optimize")
+run_sql(
+    "OPTIMIZE catalog.silver.positions_daily",
+    spark=spark,
+    maintenance_action="optimize",
+)
 ```
 
 Expected event:
@@ -541,6 +546,7 @@ from databricks_event_logger.spark import validate_row_count
 
 validate_row_count(
     table="catalog.silver.positions_daily",
+    spark=spark,
     expected_min=1,
     as_of_date=as_of_date,
 )
@@ -559,6 +565,7 @@ from databricks_event_logger.spark import count_rows
 
 row_count = count_rows(
     mapped_positions,
+    spark=spark,
     table_name="catalog.silver.positions_daily",
     as_of_date=as_of_date,
 )
@@ -575,7 +582,11 @@ Expected behavior:
 ```python
 from databricks_event_logger.spark import table_exists
 
-if not table_exists(table="catalog.bronze.co_positions", check_context="startup"):
+if not table_exists(
+    table="catalog.bronze.co_positions",
+    spark=spark,
+    check_context="startup",
+):
     raise RuntimeError("Required source table is missing.")
 ```
 
@@ -1141,7 +1152,6 @@ Build:
 Build:
 
 - `observe_notebook`.
-- `observe_notebook.from_widgets`.
 - Databricks context resolver.
 - `read_table`.
 - `write_delta`.

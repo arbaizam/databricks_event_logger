@@ -26,9 +26,3 @@ class EventLoggerConfigurationError(EventLoggerError):
     """
     Raised when logger configuration is invalid.
     """
-
-
-class EventLoggerSinkError(EventLoggerError):
-    """
-    Raised when a sink cannot persist an event outside a business-failure path.
-    """

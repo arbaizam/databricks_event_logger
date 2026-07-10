@@ -166,25 +166,6 @@ class DeltaSink:
                 f"columns: {', '.join(missing_columns)}"
             )
 
-    def flush(self) -> None:
-        """
-        Flush pending events.
-
-        Notes
-        -----
-        DeltaSink writes immediately, so there is nothing to flush.
-        """
-
-    def close(self) -> None:
-        """
-        Close the sink.
-
-        Notes
-        -----
-        The sink does not own the Spark session.
-        """
-
-
 def _column_list() -> str:
     """
     Return the event columns as a SQL column list.

@@ -3,22 +3,19 @@ Low-friction Spark observability helpers.
 
 These helpers are intentionally thin wrappers around common notebook actions.
 They use the default logger configured by ``observe_notebook`` unless an
-explicit logger is passed, and they do not import PySpark at module import time.
-That keeps the package importable in local tooling while still making notebook
-instrumentation concise.
+explicit logger is passed. The active Spark session is always an explicit
+argument; helpers never inspect caller frames or create a fallback session.
 """
 
 from __future__ import annotations
 
 import hashlib
-import inspect
 import re
 import traceback
 import warnings
 from collections.abc import Mapping, Sequence
 from typing import Any
 
-from databricks_event_logger.errors import EventLoggerConfigurationError
 from databricks_event_logger.logger import EventLogger, get_default_logger
 from databricks_event_logger.timing import elapsed_ms, monotonic_ms, utc_now
 
@@ -37,8 +34,8 @@ _THREE_PART_TABLE_NAME = re.compile(
 def read_table(
     table_name: str,
     *,
+    spark: Any,
     logger: EventLogger | None = None,
-    spark: Any | None = None,
     event_name: str = "delta.read",
     metadata: Mapping[str, Any] | None = None,
     **metadata_kwargs: Any,
@@ -52,9 +49,8 @@ def read_table(
         Source table or view name passed to ``spark.table``.
     logger : EventLogger | None, default None
         Logger to use. When omitted, the current default logger is used.
-    spark : Any | None, default None
-        Spark session. When omitted, nearby caller frames are inspected for a
-        notebook global named ``spark``.
+    spark : Any
+        Active Spark session.
     event_name : str, default "delta.read"
         Event name to emit.
     metadata : Mapping[str, Any] | None, default None
@@ -62,7 +58,7 @@ def read_table(
     **metadata_kwargs : Any
         Convenience metadata fields. These are merged with ``metadata`` and are
         intended for low-friction notebook calls such as
-        ``read_table(table, as_of_date=as_of_date)``.
+        ``read_table(table, spark=spark, as_of_date=as_of_date)``.
 
     Returns
     -------
@@ -78,7 +74,6 @@ def read_table(
     the first downstream Spark action instead of at this helper call.
     """
     resolved_logger = _resolve_logger(logger)
-    resolved_spark = _resolve_spark(spark)
     event_metadata = _merge_metadata(
         metadata,
         {"spark_operation": "table"},
@@ -90,7 +85,7 @@ def read_table(
         source_table=table_name,
         metadata=event_metadata,
     ):
-        return resolved_spark.table(table_name)
+        return spark.table(table_name)
 
 
 def write_delta(
@@ -187,8 +182,8 @@ def write_delta(
 def run_sql(
     sql_text: str,
     *,
+    spark: Any,
     logger: EventLogger | None = None,
-    spark: Any | None = None,
     event_name: str = "sql.execute",
     include_sql_preview: bool = False,
     sql_preview_chars: int = SQL_PREVIEW_CHARS,
@@ -204,9 +199,8 @@ def run_sql(
         SQL text passed to ``spark.sql``.
     logger : EventLogger | None, default None
         Logger to use. When omitted, the current default logger is used.
-    spark : Any | None, default None
-        Spark session. When omitted, nearby caller frames are inspected for a
-        notebook global named ``spark``.
+    spark : Any
+        Active Spark session.
     event_name : str, default "sql.execute"
         Event name to emit.
     include_sql_preview : bool, default False
@@ -234,7 +228,6 @@ def run_sql(
     dashboard needs searchable context.
     """
     resolved_logger = _resolve_logger(logger)
-    resolved_spark = _resolve_spark(spark)
     helper_metadata = {
         "sql_hash": hashlib.sha256(sql_text.encode("utf-8")).hexdigest(),
     }
@@ -253,15 +246,15 @@ def run_sql(
         event_type="sql",
         metadata=event_metadata,
     ):
-        return resolved_spark.sql(sql_text)
+        return spark.sql(sql_text)
 
 
 def validate_row_count(
     table_name: str | None = None,
     *,
+    spark: Any,
     table: str | None = None,
     logger: EventLogger | None = None,
-    spark: Any | None = None,
     event_name: str = "validation.row_count",
     expected_min: int | None = None,
     expected_exact: int | None = None,
@@ -279,9 +272,8 @@ def validate_row_count(
         Keyword alias for ``table_name``.
     logger : EventLogger | None, default None
         Logger to use. When omitted, the current default logger is used.
-    spark : Any | None, default None
-        Spark session. When omitted, nearby caller frames are inspected for a
-        notebook global named ``spark``.
+    spark : Any
+        Active Spark session.
     event_name : str, default "validation.row_count"
         Event name to emit.
     expected_min : int | None, default None
@@ -308,7 +300,6 @@ def validate_row_count(
 
     resolved_table = _resolve_table_name(table_name, table)
     resolved_logger = _resolve_logger(logger)
-    resolved_spark = _resolve_spark(spark)
     start_ts = utc_now()
     start_ms = monotonic_ms()
     row_count: int | None = None
@@ -321,7 +312,7 @@ def validate_row_count(
         metadata_kwargs,
     )
     try:
-        row_count = int(resolved_spark.table(resolved_table).count())
+        row_count = int(spark.table(resolved_table).count())
         _raise_for_row_count(
             resolved_table,
             row_count,
@@ -359,8 +350,8 @@ def validate_row_count(
 def count_rows(
     target: Any,
     *,
+    spark: Any,
     logger: EventLogger | None = None,
-    spark: Any | None = None,
     event_name: str = "spark.count",
     table_name: str | None = None,
     metadata: Mapping[str, Any] | None = None,
@@ -372,12 +363,12 @@ def count_rows(
     Parameters
     ----------
     target : Any
-        Spark DataFrame or table name. Passing a table name requires ``spark`` or
-        a notebook global named ``spark``.
+        Spark DataFrame or table name.
     logger : EventLogger | None, default None
         Logger to use. When omitted, the current default logger is used.
-    spark : Any | None, default None
-        Spark session used when ``target`` is a table name.
+    spark : Any
+        Active Spark session. It is used when ``target`` is a table name and is
+        required for a consistent explicit API.
     event_name : str, default "spark.count"
         Event name to emit.
     table_name : str | None, default None
@@ -404,7 +395,7 @@ def count_rows(
     dataframe = target
     if isinstance(target, str):
         source_table = target
-        dataframe = _resolve_spark(spark).table(target)
+        dataframe = spark.table(target)
     event_metadata = _merge_metadata(
         metadata,
         {"spark_operation": "count"},
@@ -444,9 +435,9 @@ def count_rows(
 def table_exists(
     table_name: str | None = None,
     *,
+    spark: Any,
     table: str | None = None,
     logger: EventLogger | None = None,
-    spark: Any | None = None,
     event_name: str = "validation.table_exists",
     metadata: Mapping[str, Any] | None = None,
     **metadata_kwargs: Any,
@@ -462,9 +453,8 @@ def table_exists(
         Keyword alias for ``table_name``.
     logger : EventLogger | None, default None
         Logger to use. When omitted, the current default logger is used.
-    spark : Any | None, default None
-        Spark session. When omitted, nearby caller frames are inspected for a
-        notebook global named ``spark``.
+    spark : Any
+        Active Spark session.
     event_name : str, default "validation.table_exists"
         Event name to emit.
     metadata : Mapping[str, Any] | None, default None
@@ -479,7 +469,6 @@ def table_exists(
     """
     resolved_table = _resolve_table_name(table_name, table)
     resolved_logger = _resolve_logger(logger)
-    resolved_spark = _resolve_spark(spark)
     start_ts = utc_now()
     start_ms = monotonic_ms()
     event_metadata = _merge_metadata(
@@ -488,11 +477,11 @@ def table_exists(
         metadata_kwargs,
     )
     try:
-        exists = bool(resolved_spark.catalog.tableExists(resolved_table))
+        exists = bool(spark.catalog.tableExists(resolved_table))
     except Exception as catalog_exc:
         try:
             exists = _table_exists_by_describe(
-                resolved_spark,
+                spark,
                 resolved_table,
             )
         except Exception:
@@ -526,40 +515,6 @@ def _resolve_logger(logger: EventLogger | None) -> EventLogger:
     Return an explicit logger or the current default logger.
     """
     return logger or get_default_logger()
-
-
-def _resolve_spark(spark: Any | None) -> Any:
-    """
-    Return an explicit Spark session or a nearby notebook global.
-    """
-    if spark is not None:
-        return spark
-    resolved_spark = _caller_value("spark")
-    if resolved_spark is None:
-        raise EventLoggerConfigurationError(
-            "No Spark session was supplied. Pass spark=... or call this helper "
-            "from a Databricks notebook where spark is defined."
-        )
-    return resolved_spark
-
-
-def _caller_value(name: str, *, max_depth: int = 10) -> Any | None:
-    """
-    Return a named value from nearby caller frames.
-    """
-    frame = inspect.currentframe()
-    frame = frame.f_back if frame is not None else None
-    for _ in range(max_depth):
-        if frame is None:
-            break
-        local_value = frame.f_locals.get(name)
-        if local_value is not None:
-            return local_value
-        global_value = frame.f_globals.get(name)
-        if global_value is not None:
-            return global_value
-        frame = frame.f_back
-    return None
 
 
 def _merge_metadata(

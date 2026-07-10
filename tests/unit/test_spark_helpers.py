@@ -246,6 +246,7 @@ def test_count_rows_logs_materialized_count_for_dataframe():
 
     count = count_rows(
         dataframe,
+        spark=_FakeSpark(row_count=0),
         logger=logger,
         table_name="catalog.schema.target",
         metric_context="post_write",
@@ -288,7 +289,11 @@ def test_count_rows_preserves_original_error_when_strict_logging_fails():
 
     with pytest.warns(RuntimeWarning, match="helper failure event"):
         with pytest.raises(RuntimeError, match="count failed"):
-            count_rows(_FailingCountDataFrame(), logger=logger)
+            count_rows(
+                _FailingCountDataFrame(),
+                spark=_FakeSpark(row_count=0),
+                logger=logger,
+            )
 
 
 def test_table_exists_logs_warning_when_table_is_missing():
@@ -506,13 +511,3 @@ class _FailingSink:
         Raise a fake sink failure.
         """
         raise RuntimeError("sink unavailable")
-
-    def flush(self) -> None:
-        """
-        No-op flush.
-        """
-
-    def close(self) -> None:
-        """
-        No-op close.
-        """

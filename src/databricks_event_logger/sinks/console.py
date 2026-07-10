@@ -39,19 +39,3 @@ class ConsoleSink:
         """
         target = self.stream or sys.stdout
         print(json.dumps(event.as_json_dict(), sort_keys=True), file=target)
-
-    def flush(self) -> None:
-        """
-        Flush the configured stream.
-        """
-        target = self.stream or sys.stdout
-        target.flush()
-
-    def close(self) -> None:
-        """
-        Close the sink.
-
-        Notes
-        -----
-        The console sink does not close caller-owned streams.
-        """

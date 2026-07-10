@@ -15,6 +15,8 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
+from databricks_event_logger.errors import EventLoggerConfigurationError
+
 
 @dataclass(frozen=True)
 class RuntimeContext:
@@ -113,37 +115,32 @@ class RuntimeContext:
 
 def resolve_databricks_context(
     *,
-    dbutils: Any | None = None,
-    spark: Any | None = None,
-    fallback: Mapping[str, Any] | None = None,
+    dbutils: Any,
+    spark: Any,
 ) -> RuntimeContext:
     """
-    Resolve Databricks runtime context without requiring Databricks imports.
+    Resolve context from an explicit Databricks Spark session and ``dbutils``.
 
     Parameters
     ----------
-    dbutils : Any | None, default None
-        Optional Databricks ``dbutils`` object. Supplying it is the most reliable
-        way to read notebook context in Databricks notebooks.
-    spark : Any | None, default None
-        Optional Spark session. When supplied, selected Spark configuration
-        values may be used as fallbacks.
-    fallback : Mapping[str, Any] | None, default None
-        Explicit caller-supplied values. These are useful in tests and for code
-        paths where a caller already resolved context externally. They override
-        heuristic runtime detection so widget/task-parameter values can remain
-        authoritative in Databricks jobs.
+    dbutils : Any
+        Databricks ``dbutils`` object.
+    spark : Any
+        Active Spark session.
 
     Returns
     -------
     RuntimeContext
         Best-effort context. Missing or inaccessible values are ``None``.
     """
+    if dbutils is None or spark is None:
+        raise EventLoggerConfigurationError(
+            "resolve_databricks_context requires both dbutils and spark."
+        )
     values: dict[str, Any] = {}
     values.update(_context_from_environment())
     values.update(_context_from_spark(spark))
     values.update(_context_from_dbutils(dbutils))
-    values.update(dict(fallback or {}))
     return RuntimeContext.from_mapping(values)
 
 
@@ -173,12 +170,10 @@ def _context_from_environment() -> dict[str, str]:
     }
 
 
-def _context_from_spark(spark: Any | None) -> dict[str, str]:
+def _context_from_spark(spark: Any) -> dict[str, str]:
     """
     Return selected Spark configuration values when available.
     """
-    if spark is None:
-        return {}
     conf = getattr(spark, "conf", None)
     if conf is None:
         return {}
@@ -197,12 +192,10 @@ def _context_from_spark(spark: Any | None) -> dict[str, str]:
     return values
 
 
-def _context_from_dbutils(dbutils: Any | None) -> dict[str, str]:
+def _context_from_dbutils(dbutils: Any) -> dict[str, str]:
     """
     Return notebook context tags from ``dbutils`` when available.
     """
-    if dbutils is None:
-        return {}
     try:
         context = dbutils.notebook.entry_point.getDbutils().notebook().getContext()
     except Exception:

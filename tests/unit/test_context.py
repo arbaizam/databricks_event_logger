@@ -52,7 +52,7 @@ def test_context_resolver_uses_standard_username_env_var(monkeypatch):
     monkeypatch.setenv("DATABRICKS_USERNAME", "user@example.com")
     monkeypatch.setenv("DATABRICKS_HOST", "https://ADB-123.azuredatabricks.net/")
 
-    context = resolve_databricks_context()
+    context = resolve_databricks_context(dbutils=object(), spark=FakeSpark({}))
 
     assert context.user_name == "user@example.com"
     assert context.workspace_url == "adb-123.azuredatabricks.net"
@@ -71,7 +71,7 @@ def test_context_resolver_uses_spark_config_when_available():
         }
     )
 
-    context = resolve_databricks_context(spark=spark)
+    context = resolve_databricks_context(dbutils=object(), spark=spark)
 
     assert context.cluster_id == "cluster-1"
     assert context.workspace_id == "workspace-1"
@@ -102,7 +102,7 @@ def test_context_resolver_uses_dbutils_context_json_for_job_fields():
     }
     dbutils = FakeDbutils(FakeNotebookContext(json_payload=payload))
 
-    context = resolve_databricks_context(dbutils=dbutils)
+    context = resolve_databricks_context(dbutils=dbutils, spark=FakeSpark({}))
 
     assert context.job_id == "123"
     assert context.run_id == "456"
@@ -136,7 +136,7 @@ def test_context_resolver_uses_dbutils_tags_when_json_is_unavailable():
         )
     )
 
-    context = resolve_databricks_context(dbutils=dbutils)
+    context = resolve_databricks_context(dbutils=dbutils, spark=FakeSpark({}))
 
     assert context.job_id == "123"
     assert context.run_id == "456"
@@ -144,44 +144,6 @@ def test_context_resolver_uses_dbutils_tags_when_json_is_unavailable():
     assert context.task_run_id == "789"
     assert context.task_attempt_number == "1"
     assert context.notebook_path == "/Workspace/smoke"
-
-
-def test_context_resolver_explicit_fallback_overrides_dbutils_context():
-    """
-    What: Lets widget/task-parameter values override heuristic dbutils context.
-    Why: Databricks dynamic task parameters are the stable job contract.
-    Fails when: dbutils context replaces explicit run/task identifiers.
-    """
-    dbutils = FakeDbutils(
-        FakeNotebookContext(
-            json_payload={
-                "currentRunId": {"id": "auto-job-run"},
-                "tags": {
-                    "taskKey": "auto_task",
-                    "taskRunId": "auto-task-run",
-                    "taskAttemptNumber": "9",
-                    "browserHostName": "auto.cloud.databricks.com",
-                },
-            }
-        )
-    )
-
-    context = resolve_databricks_context(
-        dbutils=dbutils,
-        fallback={
-            "run_id": "widget-job-run",
-            "task_key": "widget_task",
-            "task_run_id": "widget-task-run",
-            "task_attempt_number": "1",
-            "workspace_url": "widgets.cloud.databricks.com",
-        },
-    )
-
-    assert context.run_id == "widget-job-run"
-    assert context.task_key == "widget_task"
-    assert context.task_run_id == "widget-task-run"
-    assert context.task_attempt_number == "1"
-    assert context.workspace_url == "widgets.cloud.databricks.com"
 
 
 class FakeDbutils:

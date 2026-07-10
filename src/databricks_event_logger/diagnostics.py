@@ -3,7 +3,7 @@ Observability readiness diagnostics.
 
 These helpers inspect configuration without emitting events or installing a
 default logger. They are intended for notebook setup cells, smoke tests, and
-support tickets where the first question is whether events can persist.
+support tickets where the first question is whether the configured sink works.
 """
 
 from __future__ import annotations
@@ -11,14 +11,10 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 from typing import Any
 
-from databricks_event_logger._widget_utils import (
-    context_from_widgets,
-    string_or_none,
-    widget_values,
-)
 from databricks_event_logger.context import resolve_databricks_context
 from databricks_event_logger.errors import EventLoggerConfigurationError
-from databricks_event_logger.sinks.delta import DeltaSink
+from databricks_event_logger.sinks.base import EventSink
+from databricks_event_logger.sinks.console import ConsoleSink
 from databricks_event_logger.version import __version__
 
 
@@ -68,54 +64,35 @@ class ObservabilityReadinessReport:
 
 def check_observability_ready(
     *,
-    dbutils: Any | None = None,
-    spark: Any | None = None,
-    event_table: str | None = None,
-    require_persistence: bool = True,
+    dbutils: Any,
+    spark: Any,
+    sink: EventSink | None = None,
     validate_sink: bool = True,
 ) -> ObservabilityReadinessReport:
     """
     Return a compact readiness report without emitting any events.
     """
-    captured_widget_values = widget_values(dbutils)
-    resolved_event_table = string_or_none(event_table) or captured_widget_values.get(
-        "observability_event_table"
-    )
-    context = resolve_databricks_context(
-        dbutils=dbutils,
-        spark=spark,
-        fallback=context_from_widgets(captured_widget_values),
-    )
+    resolved_sink = sink if sink is not None else ConsoleSink()
+    context = resolve_databricks_context(dbutils=dbutils, spark=spark)
     checks = {
-        "dbutils_supplied": dbutils is not None,
-        "spark_supplied": spark is not None,
-        "event_table_configured": bool(resolved_event_table),
-        "persistent_sink": bool(spark is not None and resolved_event_table),
-        "table_validated": False,
+        "runtime_context_resolved": True,
+        "sink_validated": not validate_sink,
     }
     issues: list[str] = []
-    sink_type = "DeltaSink" if checks["persistent_sink"] else "MemorySink"
-
-    if require_persistence and not checks["persistent_sink"]:
-        issues.append(
-            "Persistent event logging is required, but spark or "
-            "observability_event_table is missing."
-        )
-
-    if validate_sink and checks["persistent_sink"]:
+    if validate_sink and hasattr(resolved_sink, "validate"):
         try:
-            DeltaSink(spark=spark, table_name=resolved_event_table).validate()
+            resolved_sink.validate()
         except Exception as exc:
-            issues.append(f"DeltaSink validation failed: {exc}")
+            issues.append(f"{type(resolved_sink).__name__} validation failed: {exc}")
         else:
-            checks["table_validated"] = True
-    elif not validate_sink:
-        checks["table_validated"] = True
+            checks["sink_validated"] = True
+    elif validate_sink:
+        checks["sink_validated"] = True
 
     return ObservabilityReadinessReport(
         package_version=__version__,
-        sink_type=sink_type,
-        event_table=resolved_event_table,
+        sink_type=type(resolved_sink).__name__,
+        event_table=getattr(resolved_sink, "table_name", None),
         checks=checks,
         issues=tuple(issues),
         context=context.as_dict(),
@@ -124,10 +101,9 @@ def check_observability_ready(
 
 def assert_observability_ready(
     *,
-    dbutils: Any | None = None,
-    spark: Any | None = None,
-    event_table: str | None = None,
-    require_persistence: bool = True,
+    dbutils: Any,
+    spark: Any,
+    sink: EventSink | None = None,
     validate_sink: bool = True,
 ) -> ObservabilityReadinessReport:
     """
@@ -136,8 +112,7 @@ def assert_observability_ready(
     report = check_observability_ready(
         dbutils=dbutils,
         spark=spark,
-        event_table=event_table,
-        require_persistence=require_persistence,
+        sink=sink,
         validate_sink=validate_sink,
     )
     if not report.ready:

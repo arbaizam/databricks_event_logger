@@ -10,7 +10,6 @@ the original exception for Databricks job failure semantics.
 from __future__ import annotations
 
 import hashlib
-import inspect
 import traceback
 import warnings
 from collections.abc import Callable, Mapping
@@ -21,11 +20,6 @@ from functools import wraps
 from typing import Any, TypeVar
 from uuid import uuid4
 
-from databricks_event_logger._widget_utils import (
-    context_from_widgets,
-    widget_value,
-    widget_values,
-)
 from databricks_event_logger.config import EventLoggerConfig
 from databricks_event_logger.context import RuntimeContext, resolve_databricks_context
 from databricks_event_logger.errors import EventLoggerConfigurationError
@@ -37,8 +31,7 @@ from databricks_event_logger.serialization import (
     serialize_metadata,
 )
 from databricks_event_logger.sinks.base import EventSink
-from databricks_event_logger.sinks.delta import DeltaSink
-from databricks_event_logger.sinks.memory import MemorySink
+from databricks_event_logger.sinks.console import ConsoleSink
 from databricks_event_logger.timing import elapsed_ms, monotonic_ms, utc_now
 
 F = TypeVar("F", bound=Callable[..., Any])
@@ -68,18 +61,14 @@ class EventLogger:
     environment : str | None, default None
         Environment or bundle target stamped onto emitted events.
     sink : EventSink | None, default None
-        Event sink. When omitted, events are stored in an in-memory sink. This
-        avoids accidental Delta writes in tests and still gives callers a real
-        emitted event object.
+        Event sink. When omitted, events are written as JSON lines through
+        ``ConsoleSink``.
     context : RuntimeContext | None, default None
         Runtime context to attach to events.
     correlation_id : str | None, default None
         Correlation identifier shared by emitted events. When omitted, the
         logger derives a stable value from Databricks task/run context when
         available and falls back to a UUID outside Databricks.
-    event_table : str | None, default None
-        Fully qualified event table for Delta-backed usage. Stored in config
-        but not used unless a Delta sink is configured.
     default_metadata : dict[str, Any] | None, default None
         Metadata merged into every event emitted by this logger. Event-level
         metadata wins when the same key appears in both places.
@@ -110,7 +99,6 @@ class EventLogger:
         sink: EventSink | None = None,
         context: RuntimeContext | None = None,
         correlation_id: str | None = None,
-        event_table: str | None = None,
         default_metadata: dict[str, Any] | None = None,
         metadata_max_bytes: int | None = DEFAULT_METADATA_MAX_BYTES,
         metadata_string_max_chars: int | None = DEFAULT_METADATA_STRING_MAX_CHARS,
@@ -126,13 +114,12 @@ class EventLogger:
             app_name=app_name,
             component=component,
             environment=environment,
-            event_table=event_table,
         )
         self.context = context or RuntimeContext()
         self.correlation_id = (
             correlation_id or _correlation_id_from_context(self.context) or str(uuid4())
         )
-        self.sink: EventSink = sink or MemorySink()
+        self.sink: EventSink = sink if sink is not None else ConsoleSink()
         self.default_metadata = dict(default_metadata or {})
         self.metadata_max_bytes = metadata_max_bytes
         self.metadata_string_max_chars = metadata_string_max_chars
@@ -473,18 +460,6 @@ class EventLogger:
             metadata=metadata,
         )
 
-    def flush(self) -> None:
-        """
-        Flush the configured sink.
-        """
-        self._call_sink("flush")
-
-    def close(self) -> None:
-        """
-        Close the configured sink.
-        """
-        self._call_sink("close")
-
     def _run_observed(
         self,
         event_name: str,
@@ -645,20 +620,6 @@ class EventLogger:
             stacklevel=3,
         )
 
-    def _call_sink(self, method_name: str) -> None:
-        """
-        Call a sink lifecycle method and warn on failure.
-        """
-        try:
-            getattr(self.sink, method_name)()
-        except Exception as exc:
-            warnings.warn(
-                f"Failed to {method_name} event sink: {exc}",
-                RuntimeWarning,
-                stacklevel=2,
-            )
-
-
 def set_default_logger(logger: EventLogger) -> None:
     """
     Set the default logger for decorators and helper functions.
@@ -695,285 +656,49 @@ def get_default_logger() -> EventLogger:
     return logger
 
 
-class NotebookObserver:
+def observe_notebook(
+    *,
+    spark: Any,
+    dbutils: Any,
+    app_name: str | None = None,
+    component: str | None = None,
+    environment: str | None = None,
+    sink: EventSink | None = None,
+    correlation_id: str | None = None,
+    default_metadata: dict[str, Any] | None = None,
+    strict_logging: bool = False,
+) -> EventLogger:
     """
-    Callable notebook bootstrap helper.
+    Initialize the default Databricks notebook logger and emit ``notebook.started``.
+
+    ``spark`` and ``dbutils`` are explicit required dependencies. The default
+    sink is ``ConsoleSink``; pass ``DeltaSink(spark, table_name)`` when events
+    must be persisted.
     """
-
-    def __call__(
-        self,
-        *,
-        app_name: str | None = None,
-        component: str | None = None,
-        environment: str | None = None,
-        event_table: str | None = None,
-        sink: EventSink | None = None,
-        spark: Any | None = None,
-        dbutils: Any | None = None,
-        context: RuntimeContext | None = None,
-        require_persistence: bool = False,
-        validate_sink: bool = False,
-        default_metadata: dict[str, Any] | None = None,
-        metadata_max_bytes: int | None = DEFAULT_METADATA_MAX_BYTES,
-        metadata_string_max_chars: int | None = DEFAULT_METADATA_STRING_MAX_CHARS,
-        error_message_max_chars: int | None = 2000,
-        redact_keys: tuple[str, ...] = DEFAULT_REDACT_KEYS,
-        strict_logging: bool = False,
-        max_events_warning_threshold: int | None = 100,
-    ) -> EventLogger:
-        """
-        Initialize the default logger and emit ``notebook.started``.
-
-        ``observe_notebook`` records notebook startup only. Use
-        ``logger.run_task(...)`` around the notebook's main callable when a
-        terminal success or failure event is required.
-
-        Parameters
-        ----------
-        app_name, component, environment : str | None
-            Event identity fields passed by the job or bundle.
-        event_table : str | None, default None
-            Fully qualified event table used when constructing a Delta sink.
-        sink : EventSink | None, default None
-            Explicit sink. When omitted and both ``spark`` and ``event_table``
-            are supplied, a ``DeltaSink`` is used. Otherwise a ``MemorySink`` is
-            used. Passing ``event_table`` without ``spark`` does not create
-            Delta writes.
-        spark : Any | None, default None
-            Spark session for context capture and optional Delta sink creation.
-        dbutils : Any | None, default None
-            Databricks dbutils object for context capture.
-        context : RuntimeContext | None, default None
-            Explicit runtime context.
-            When omitted and ``dbutils`` is supplied, optional context widgets
-            such as ``task_key`` and ``task_run_id`` are used as fallbacks.
-        require_persistence : bool, default False
-            When True, raise instead of falling back to ``MemorySink`` unless
-            the resolved sink is ``DeltaSink``.
-        validate_sink : bool, default False
-            When True and the resolved sink exposes ``validate()``, run that
-            validation before startup events are emitted.
-        default_metadata, metadata_max_bytes, metadata_string_max_chars,
-        error_message_max_chars, redact_keys, strict_logging,
-        max_events_warning_threshold
-            Logger-level metadata governance and production guardrails passed
-            to ``EventLogger``.
-
-        Returns
-        -------
-        EventLogger
-            Configured default logger.
-        """
-        captured_widget_values = widget_values(dbutils)
-        resolved_context = context or resolve_databricks_context(
-            dbutils=dbutils,
-            spark=spark,
-            fallback=context_from_widgets(captured_widget_values),
-        )
-        resolved_sink = sink
-        if resolved_sink is None:
-            if event_table and spark is None and not require_persistence:
-                warnings.warn(
-                    "observability_event_table was provided but no Spark session was supplied. "
-                    "Events will be stored in MemorySink and will not be persisted.",
-                    RuntimeWarning,
-                    stacklevel=2,
-                )
-            elif spark is not None and not event_table and not require_persistence:
-                warnings.warn(
-                    "A Spark session was supplied but observability_event_table "
-                    "is missing or blank. Events will be stored in MemorySink "
-                    "and will not be persisted.",
-                    RuntimeWarning,
-                    stacklevel=2,
-                )
-            elif spark is not None and event_table:
-                resolved_sink = DeltaSink(spark=spark, table_name=event_table)
-        if require_persistence and not isinstance(resolved_sink, DeltaSink):
-            raise EventLoggerConfigurationError(
-                "Persistent event logging is required, but no DeltaSink could be "
-                "configured. Pass spark and a three-part observability_event_table, "
-                "or pass an explicit DeltaSink."
-            )
-        if validate_sink and hasattr(resolved_sink, "validate"):
-            resolved_sink.validate()
-        logger = EventLogger(
-            app_name=app_name,
-            component=component,
-            environment=environment,
-            sink=resolved_sink,
-            context=resolved_context,
-            event_table=event_table,
-            default_metadata=default_metadata,
-            metadata_max_bytes=metadata_max_bytes,
-            metadata_string_max_chars=metadata_string_max_chars,
-            error_message_max_chars=error_message_max_chars,
-            redact_keys=redact_keys,
-            strict_logging=strict_logging,
-            max_events_warning_threshold=max_events_warning_threshold,
-        )
-        set_default_logger(logger)
-        logger.record_event(
-            "notebook.started",
-            event_type="notebook",
-            status="started",
-            metadata={
-                "sink_type": type(logger.sink).__name__,
-                "event_table": event_table,
-                "require_persistence": require_persistence,
-                "validate_sink": validate_sink,
-                "strict_logging": strict_logging,
-                "job_url": logger.job_url,
-                "job_run_url": logger.job_run_url,
-            },
-        )
-        return logger
-
-    def from_widgets(
-        self,
-        *,
-        dbutils: Any | None = None,
-        spark: Any | None = None,
-        sink: EventSink | None = None,
-        require_persistence: bool = False,
-        validate_sink: bool = False,
-        default_metadata: dict[str, Any] | None = None,
-        metadata_max_bytes: int | None = DEFAULT_METADATA_MAX_BYTES,
-        metadata_string_max_chars: int | None = DEFAULT_METADATA_STRING_MAX_CHARS,
-        error_message_max_chars: int | None = 2000,
-        redact_keys: tuple[str, ...] = DEFAULT_REDACT_KEYS,
-        strict_logging: bool = False,
-        max_events_warning_threshold: int | None = 100,
-    ) -> EventLogger:
-        """
-        Initialize a logger from standard Databricks widgets.
-
-        The expected widget names are ``app_name``, ``component``,
-        ``environment``, and ``observability_event_table``. When ``dbutils`` or
-        ``spark`` are omitted, this method performs a bounded lookup through
-        caller frames for notebook globals with those names. Passing them
-        explicitly is preferred for package code and tests. Optional widgets
-        named ``workspace_id``, ``workspace_url``, ``cluster_id``, ``job_id``,
-        ``run_id``, ``task_key``, ``task_run_id``,
-        ``task_attempt_number``, ``job_start_time``, ``job_trigger_type``,
-        ``notebook_path``, ``user_name``, and ``run_as_user_name`` are used as
-        context fallbacks when the Databricks runtime context does not expose
-        those fields directly.
-
-        Parameters
-        ----------
-        dbutils : Any | None, default None
-            Optional dbutils object. When omitted, the caller's notebook globals
-            are inspected for ``dbutils``.
-        spark : Any | None, default None
-            Optional Spark session. When omitted, the caller's notebook globals
-            are inspected for ``spark``.
-        sink : EventSink | None, default None
-            Explicit sink for tests or custom persistence.
-        require_persistence : bool, default False
-            When True, fail notebook bootstrap if a ``DeltaSink`` cannot be
-            configured.
-        validate_sink : bool, default False
-            When True, validate the resolved sink before emitting
-            ``notebook.started``.
-        default_metadata, metadata_max_bytes, metadata_string_max_chars,
-        error_message_max_chars, redact_keys, strict_logging,
-        max_events_warning_threshold
-            Logger-level metadata governance and production guardrails passed
-            through to ``observe_notebook(...)``.
-
-        Returns
-        -------
-        EventLogger
-            Configured default logger.
-        """
-        resolved_dbutils = dbutils
-        frame_inspected_names: list[str] = []
-        if resolved_dbutils is None:
-            resolved_dbutils = _caller_global("dbutils")
-            if resolved_dbutils is not None:
-                frame_inspected_names.append("dbutils")
-        resolved_spark = spark
-        if resolved_spark is None:
-            resolved_spark = _caller_global("spark")
-            if resolved_spark is not None:
-                frame_inspected_names.append("spark")
-        if frame_inspected_names:
-            inspected = _join_names(frame_inspected_names)
-            warnings.warn(
-                "observe_notebook.from_widgets() found "
-                f"{inspected} through frame inspection. Pass {inspected} "
-                "explicitly in production notebooks.",
-                RuntimeWarning,
-                stacklevel=2,
-            )
-        captured_widget_values = widget_values(resolved_dbutils)
-        context = resolve_databricks_context(
-            dbutils=resolved_dbutils,
-            spark=resolved_spark,
-            fallback=context_from_widgets(captured_widget_values),
-        )
-        return self(
-            app_name=widget_value(captured_widget_values, "app_name"),
-            component=widget_value(captured_widget_values, "component"),
-            environment=widget_value(captured_widget_values, "environment"),
-            event_table=widget_value(
-                captured_widget_values,
-                "observability_event_table",
-            ),
-            sink=sink,
-            spark=resolved_spark,
-            dbutils=resolved_dbutils,
-            context=context,
-            require_persistence=require_persistence,
-            validate_sink=validate_sink,
-            default_metadata=default_metadata,
-            metadata_max_bytes=metadata_max_bytes,
-            metadata_string_max_chars=metadata_string_max_chars,
-            error_message_max_chars=error_message_max_chars,
-            redact_keys=redact_keys,
-            strict_logging=strict_logging,
-            max_events_warning_threshold=max_events_warning_threshold,
-        )
-
-    def production_from_widgets(
-        self,
-        *,
-        dbutils: Any | None = None,
-        spark: Any | None = None,
-        sink: EventSink | None = None,
-        default_metadata: dict[str, Any] | None = None,
-        metadata_max_bytes: int | None = DEFAULT_METADATA_MAX_BYTES,
-        metadata_string_max_chars: int | None = DEFAULT_METADATA_STRING_MAX_CHARS,
-        error_message_max_chars: int | None = 2000,
-        redact_keys: tuple[str, ...] = DEFAULT_REDACT_KEYS,
-        max_events_warning_threshold: int | None = 100,
-    ) -> EventLogger:
-        """
-        Initialize production observability from standard Databricks widgets.
-
-        This is a convenience preset for the recommended production controls:
-        persistent Delta logging is required, the sink is validated before
-        startup events are emitted, and sink failures on successful business
-        paths are treated as errors.
-        """
-        return self.from_widgets(
-            dbutils=dbutils,
-            spark=spark,
-            sink=sink,
-            require_persistence=True,
-            validate_sink=True,
-            default_metadata=default_metadata,
-            metadata_max_bytes=metadata_max_bytes,
-            metadata_string_max_chars=metadata_string_max_chars,
-            error_message_max_chars=error_message_max_chars,
-            redact_keys=redact_keys,
-            strict_logging=True,
-            max_events_warning_threshold=max_events_warning_threshold,
-        )
-
-
-observe_notebook = NotebookObserver()
+    logger = EventLogger(
+        app_name=app_name,
+        component=component,
+        environment=environment,
+        sink=sink,
+        context=resolve_databricks_context(dbutils=dbutils, spark=spark),
+        correlation_id=correlation_id,
+        default_metadata=default_metadata,
+        strict_logging=strict_logging,
+    )
+    set_default_logger(logger)
+    logger.record_event(
+        "notebook.started",
+        event_type="notebook",
+        status="started",
+        metadata={
+            "sink_type": type(logger.sink).__name__,
+            "event_table": getattr(logger.sink, "table_name", None),
+            "strict_logging": strict_logging,
+            "job_url": logger.job_url,
+            "job_run_url": logger.job_run_url,
+        },
+    )
+    return logger
 
 
 def _stack_trace_hash(exc: BaseException) -> str:
@@ -1098,34 +823,3 @@ def _workspace_url_with_scheme(workspace_url: str | None) -> str | None:
     if normalized.startswith("http://") or normalized.startswith("https://"):
         return normalized
     return f"https://{normalized}"
-
-
-def _join_names(names: list[str]) -> str:
-    """
-    Join names for compact warning text.
-    """
-    if len(names) == 1:
-        return names[0]
-    return f"{', '.join(names[:-1])} and {names[-1]}"
-
-
-def _caller_global(name: str, *, max_depth: int = 10) -> Any | None:
-    """
-    Return a value from a nearby caller frame that defines ``name``.
-
-    This keeps ``observe_notebook.from_widgets()`` low-burden in Databricks
-    notebooks while avoiding a hard dependency on notebook-only globals.
-    """
-    frame = inspect.currentframe()
-    frame = frame.f_back if frame is not None else None
-    for _ in range(max_depth):
-        if frame is None:
-            break
-        local_value = frame.f_locals.get(name)
-        if local_value is not None:
-            return local_value
-        global_value = frame.f_globals.get(name)
-        if global_value is not None:
-            return global_value
-        frame = frame.f_back
-    return None

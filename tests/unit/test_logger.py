@@ -5,6 +5,8 @@ import pytest
 
 from databricks_event_logger import (
     CommonEvent,
+    ConsoleSink,
+    DeltaSink,
     EventLogger,
     EventSeverity,
     EventStatus,
@@ -395,7 +397,14 @@ def test_observed_decorator_uses_default_logger_at_call_time():
     """
     def run():
         sink = MemorySink()
-        observe_notebook(app_name="app", component="component", environment="dev", sink=sink)
+        observe_notebook(
+            spark=object(),
+            dbutils=object(),
+            app_name="app",
+            component="component",
+            environment="dev",
+            sink=sink,
+        )
 
         @observed("reporting.default_logger")
         def work():
@@ -416,7 +425,14 @@ def test_observed_metadata_factory_uses_default_logger_at_call_time():
     """
     def run():
         sink = MemorySink()
-        observe_notebook(app_name="app", component="component", environment="dev", sink=sink)
+        observe_notebook(
+            spark=object(),
+            dbutils=object(),
+            app_name="app",
+            component="component",
+            environment="dev",
+            sink=sink,
+        )
 
         @observed(
             "reporting.default_logger.dynamic",
@@ -435,167 +451,55 @@ def test_observed_metadata_factory_uses_default_logger_at_call_time():
     Context().run(run)
 
 
-def test_observe_notebook_from_widgets_uses_optional_context_widgets():
-    """
-    What: Uses optional widget values as runtime context fallbacks.
-    Why: Databricks exposes task name/execution count as dynamic task parameters.
-    Fails when: Job task smoke tests cannot populate task_key or attempt fields.
-    """
+def test_event_logger_defaults_to_console_sink():
+    """The default sink is visible notebook output, not implicit persistence."""
+    assert isinstance(EventLogger().sink, ConsoleSink)
+
+
+def test_observe_notebook_requires_explicit_runtime_dependencies():
+    """Notebook bootstrap has no frame or non-Databricks fallback."""
+    with pytest.raises(TypeError):
+        observe_notebook()
+    with pytest.raises(EventLoggerConfigurationError, match="requires both"):
+        observe_notebook(spark=None, dbutils=object())
+
+
+def test_observe_notebook_uses_explicit_configuration_and_correlation():
+    """Bootstrap passes explicit identity, sink, and correlation settings through."""
     sink = MemorySink()
-    dbutils = FakeDbutils(
-        {
-            "app_name": "app",
-            "component": "component",
-            "environment": "dev",
-            "observability_event_table": "catalog.schema.event_log",
-            "task_key": "smoke_task",
-            "task_run_id": "task-run-1",
-            "task_attempt_number": "1",
-            "job_start_time": "2026-06-04T13:00:00Z",
-            "job_trigger_type": "one_time",
-            "notebook_path": "/Workspace/smoke",
-            "run_as_user_name": "svc@example.com",
-        }
-    )
-
-    logger = observe_notebook.from_widgets(dbutils=dbutils, sink=sink)
-
-    assert logger.context.task_key == "smoke_task"
-    assert logger.context.task_run_id == "task-run-1"
-    assert logger.context.task_attempt_number == "1"
-    assert logger.context.job_start_time == "2026-06-04T13:00:00Z"
-    assert logger.context.job_trigger_type == "one_time"
-    assert logger.context.notebook_path == "/Workspace/smoke"
-    assert logger.context.run_as_user_name == "svc@example.com"
-    assert sink.events[-1].task_key == "smoke_task"
-    assert sink.events[-1].task_run_id == "task-run-1"
-
-
-def test_observe_notebook_from_widgets_uses_delta_sink_when_configured():
-    """
-    What: Creates a DeltaSink when widgets provide an event table and Spark is supplied.
-    Why: The standard job bootstrap path should persist events without extra sink wiring.
-    Fails when: from_widgets falls back to MemorySink despite complete persistence config.
-    """
-    pytest.importorskip("pyspark")
-
-    dbutils = FakeDbutils(
-        {
-            "app_name": "app",
-            "component": "component",
-            "environment": "dev",
-            "observability_event_table": "catalog.schema.event_log",
-        }
-    )
-    spark = FakeSpark()
-
-    def run():
-        logger = observe_notebook.from_widgets(dbutils=dbutils, spark=spark)
-
-        assert type(logger.sink).__name__ == "DeltaSink"
-        assert spark.sql_calls[0].startswith("INSERT INTO catalog.schema.event_log")
-        assert spark.data[0]["event_name"] == "notebook.started"
-
-    Context().run(run)
-
-
-def test_observe_notebook_direct_uses_optional_context_widgets():
-    """
-    What: Uses optional widget values when bootstrapping directly.
-    Why: Some notebooks pass app/table arguments directly but task context via parameters.
-    Fails when: Direct observe_notebook calls ignore task parameter widgets.
-    """
-    sink = MemorySink()
-    dbutils = FakeDbutils(
-        {
-            "task_key": "smoke_task",
-            "task_run_id": "task-run-1",
-            "task_attempt_number": "1",
-            "job_start_time": "2026-06-04T13:00:00Z",
-        }
-    )
 
     logger = observe_notebook(
+        spark=object(),
+        dbutils=object(),
         app_name="app",
         component="component",
         environment="dev",
+        correlation_id="workflow-123",
         sink=sink,
-        dbutils=dbutils,
     )
 
-    assert logger.context.task_key == "smoke_task"
-    assert logger.context.task_run_id == "task-run-1"
-    assert logger.context.task_attempt_number == "1"
-    assert logger.context.job_start_time == "2026-06-04T13:00:00Z"
-    assert sink.events[-1].task_key == "smoke_task"
+    assert logger.config.app_name == "app"
+    assert logger.config.component == "component"
+    assert logger.config.environment == "dev"
+    assert logger.correlation_id == "workflow-123"
+    assert sink.events[-1].event_name == "notebook.started"
+    assert sink.events[-1].correlation_id == "workflow-123"
 
 
-def test_observe_notebook_warns_when_event_table_cannot_persist():
-    """
-    What: Warns when an event table is supplied without a Spark session.
-    Why: Production jobs should not silently fall back to non-persistent memory events.
-    Fails when: Missing Spark causes silent event loss.
-    """
-    def run():
-        with pytest.warns(RuntimeWarning, match="observability_event_table"):
-            logger = observe_notebook(
-                app_name="app",
-                component="component",
-                environment="dev",
-                event_table="catalog.schema.event_log",
-            )
-        assert isinstance(logger.sink, MemorySink)
+def test_observe_notebook_uses_explicit_delta_sink():
+    """Delta persistence is explicit instead of inferred from a table parameter."""
+    pytest.importorskip("pyspark")
+    spark = FakeSpark()
 
-    Context().run(run)
+    logger = observe_notebook(
+        spark=spark,
+        dbutils=object(),
+        sink=DeltaSink(spark=spark, table_name="catalog.schema.event_log"),
+    )
 
-
-def test_observe_notebook_warns_when_spark_has_no_event_table():
-    """
-    What: Warns when Spark is supplied but no event table is configured.
-    Why: A Spark-backed job usually expects Delta persistence.
-    Fails when: Missing event table causes silent MemorySink fallback.
-    """
-    def run():
-        with pytest.warns(RuntimeWarning, match="observability_event_table"):
-            logger = observe_notebook(
-                app_name="app",
-                component="component",
-                environment="dev",
-                spark=object(),
-            )
-        assert isinstance(logger.sink, MemorySink)
-
-    Context().run(run)
-
-
-def test_observe_notebook_from_widgets_warns_on_frame_inspection():
-    """
-    What: Warns once when globals are discovered through caller-frame inspection.
-    Why: Production notebooks should pass dbutils and spark explicitly.
-    Fails when: Fragile implicit lookup remains invisible or emits noisy duplicate warnings.
-    """
-    def run():
-        dbutils = FakeDbutils(
-            {
-                "app_name": "app",
-                "component": "component",
-                "environment": "dev",
-            }
-        )
-        spark = object()
-        sink = MemorySink()
-
-        with warnings.catch_warnings(record=True) as warning_records:
-            warnings.simplefilter("always")
-            logger = observe_notebook.from_widgets(sink=sink)
-
-        assert logger.config.app_name == "app"
-        assert dbutils.widgets.get("app_name") == "app"
-        assert spark is not None
-        assert len(warning_records) == 1
-        assert "dbutils and spark" in str(warning_records[0].message)
-
-    Context().run(run)
+    assert isinstance(logger.sink, DeltaSink)
+    assert spark.sql_calls[0].startswith("INSERT INTO catalog.schema.event_log")
+    assert spark.data[0]["event_name"] == "notebook.started"
 
 
 def test_get_default_logger_requires_bootstrap():
@@ -701,29 +605,22 @@ def test_observe_notebook_started_event_includes_bootstrap_diagnostics():
     Fails when: notebook.started omits production bootstrap details.
     """
     sink = MemorySink()
-    context = RuntimeContext(
-        workspace_url="workspace.cloud.databricks.com",
-        job_id="123",
-        run_id="456",
-    )
 
     logger = observe_notebook(
+        spark=object(),
+        dbutils=object(),
         app_name="app",
         component="component",
         environment="dev",
         sink=sink,
-        context=context,
-        require_persistence=False,
-        validate_sink=True,
         strict_logging=True,
     )
     metadata = deserialize_metadata(sink.events[-1].metadata_json)
 
     assert logger is get_default_logger()
     assert metadata["sink_type"] == "MemorySink"
-    assert metadata["validate_sink"] is True
     assert metadata["strict_logging"] is True
-    assert metadata["job_run_url"] == "https://workspace.cloud.databricks.com/jobs/123/runs/456"
+    assert metadata["event_table"] is None
 
 
 def test_event_volume_warning_emits_once():
@@ -744,66 +641,17 @@ def test_event_volume_warning_emits_once():
     assert not warning_records
 
 
-def test_observe_notebook_requires_persistence_when_requested():
-    """
-    What: Fails bootstrap when production persistence is required but unavailable.
-    Why: Production jobs should not silently fall back to MemorySink.
-    Fails when: require_persistence=True still allows in-memory events.
-    """
-    with warnings.catch_warnings(record=True) as warning_records:
-        warnings.simplefilter("always")
-        with pytest.raises(EventLoggerConfigurationError, match="Persistent event logging"):
-            observe_notebook(
-                app_name="app",
-                component="component",
-                environment="dev",
-                event_table="catalog.schema.event_log",
-                require_persistence=True,
-            )
-
-    assert not warning_records
-
-
-def test_production_from_widgets_enables_production_controls():
-    """
-    What: Applies the production bootstrap preset from widgets.
-    Why: Production jobs should not require developers to remember multiple flags.
-    Fails when: production_from_widgets does not fail fast or validate the sink.
-    """
-    pytest.importorskip("pyspark")
-    dbutils = FakeDbutils(
-        {
-            "app_name": "app",
-            "component": "component",
-            "environment": "prod",
-            "observability_event_table": "catalog.schema.event_log",
-        }
+def test_check_observability_ready_uses_console_sink_by_default():
+    """Readiness reports the same explicit default used by EventLogger."""
+    report = check_observability_ready(
+        dbutils=object(),
+        spark=object(),
+        validate_sink=False,
     )
-    spark = FakeSpark(describe_columns=FULL_EVENT_COLUMNS)
 
-    logger = observe_notebook.production_from_widgets(dbutils=dbutils, spark=spark)
-    metadata = deserialize_metadata(spark.data[0]["metadata_json"])
-
-    assert type(logger.sink).__name__ == "DeltaSink"
-    assert logger.strict_logging is True
-    assert metadata["require_persistence"] is True
-    assert metadata["validate_sink"] is True
-    assert metadata["strict_logging"] is True
-    assert spark.sql_calls[0].startswith("DESCRIBE TABLE catalog.schema.event_log")
-    assert spark.sql_calls[1].startswith("INSERT INTO catalog.schema.event_log")
-
-
-def test_check_observability_ready_reports_missing_persistence():
-    """
-    What: Reports readiness issues without configuring the default logger.
-    Why: Setup diagnostics should be available before emitting events.
-    Fails when: Missing Spark/table configuration is not visible.
-    """
-    report = check_observability_ready(require_persistence=True, validate_sink=False)
-
-    assert report.ready is False
-    assert report.sink_type == "MemorySink"
-    assert "Persistent event logging is required" in report.issues[0]
+    assert report.ready is True
+    assert report.sink_type == "ConsoleSink"
+    assert report.event_table is None
 
 
 def test_assert_observability_ready_returns_report_when_ready():
@@ -812,18 +660,16 @@ def test_assert_observability_ready_returns_report_when_ready():
     Why: Production notebooks need a compact preflight check.
     Fails when: The assert helper emits events or rejects valid basic configuration.
     """
-    dbutils = FakeDbutils({"observability_event_table": "catalog.schema.event_log"})
-
     report = assert_observability_ready(
-        dbutils=dbutils,
+        dbutils=object(),
         spark=object(),
-        require_persistence=True,
+        sink=MemorySink(),
         validate_sink=False,
     )
 
     assert report.ready is True
-    assert report.sink_type == "DeltaSink"
-    assert report.event_table == "catalog.schema.event_log"
+    assert report.sink_type == "MemorySink"
+    assert report.event_table is None
 
 
 def test_check_observability_ready_reports_delta_validation_failure():
@@ -832,37 +678,19 @@ def test_check_observability_ready_reports_delta_validation_failure():
     Why: Preflight checks should catch bad event table deployment before bootstrap.
     Fails when: Readiness diagnostics ignore a malformed event log table.
     """
-    dbutils = FakeDbutils({"observability_event_table": "catalog.schema.event_log"})
     spark = FakeSpark(describe_columns=["event_name"])
+    sink = DeltaSink(spark=spark, table_name="catalog.schema.event_log")
 
     report = check_observability_ready(
-        dbutils=dbutils,
+        dbutils=object(),
         spark=spark,
-        require_persistence=True,
+        sink=sink,
         validate_sink=True,
     )
 
     assert report.ready is False
     assert report.sink_type == "DeltaSink"
     assert "missing required columns" in report.issues[0]
-
-
-class FakeDbutils:
-    def __init__(self, widget_values):
-        self.widgets = FakeWidgets(widget_values)
-
-
-class FakeWidgets:
-    def __init__(self, values):
-        self._values = values
-
-    def get(self, name):
-        if name not in self._values:
-            raise KeyError(name)
-        return self._values[name]
-
-    def getAll(self):  # noqa: N802 - Databricks widget API casing.
-        return dict(self._values)
 
 
 class FakeSpark:
@@ -899,52 +727,3 @@ class FakeDescribeResult:
 class FailingSink:
     def emit(self, event):
         raise RuntimeError("sink unavailable")
-
-    def flush(self):
-        pass
-
-    def close(self):
-        pass
-
-
-FULL_EVENT_COLUMNS = (
-    "event_name",
-    "event_type",
-    "status",
-    "event_id",
-    "correlation_id",
-    "parent_event_id",
-    "event_ts",
-    "event_date",
-    "start_ts",
-    "end_ts",
-    "duration_ms",
-    "severity",
-    "app_name",
-    "component",
-    "environment",
-    "sdk_version",
-    "workspace_id",
-    "workspace_url",
-    "cluster_id",
-    "job_id",
-    "run_id",
-    "task_key",
-    "task_run_id",
-    "task_attempt_number",
-    "job_start_time",
-    "job_trigger_type",
-    "notebook_path",
-    "user_name",
-    "run_as_user_name",
-    "source_table",
-    "target_table",
-    "row_count",
-    "metric_name",
-    "metric_value",
-    "error_class",
-    "error_message",
-    "stack_trace_hash",
-    "metadata_json",
-    "created_at",
-)

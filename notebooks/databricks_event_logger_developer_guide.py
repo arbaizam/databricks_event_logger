@@ -6,8 +6,8 @@
 # MAGIC
 # MAGIC It demonstrates:
 # MAGIC
-# MAGIC - widget-driven notebook bootstrap
-# MAGIC - Delta sink versus memory sink behavior
+# MAGIC - explicit notebook bootstrap
+# MAGIC - console versus Delta sink behavior
 # MAGIC - explicit events
 # MAGIC - decorators
 # MAGIC - context-manager logging
@@ -38,12 +38,8 @@
 # MAGIC - `environment`
 # MAGIC - `observability_event_table`
 # MAGIC
-# MAGIC If `observability_event_table` is blank, the logger uses `MemorySink` and
-# MAGIC does not persist events to Delta.
-# MAGIC
-# MAGIC The context widgets are optional fallbacks. They are helpful in jobs because
-# MAGIC Databricks context APIs do not expose every field consistently across all
-# MAGIC runtime modes.
+# MAGIC If `observability_event_table` is blank, this guide uses `ConsoleSink`.
+# MAGIC Otherwise, it explicitly constructs and validates a `DeltaSink`.
 
 # COMMAND ----------
 
@@ -51,23 +47,10 @@ dbutils.widgets.text("app_name", "databricks_event_logger_demo")
 dbutils.widgets.text("component", "developer_guide")
 dbutils.widgets.text("environment", "dev")
 dbutils.widgets.text("observability_event_table", "")
-
-dbutils.widgets.text("workspace_id", "")
-dbutils.widgets.text("workspace_url", "")
-dbutils.widgets.text("job_id", "")
-dbutils.widgets.text("run_id", "")
-dbutils.widgets.text("task_key", "")
-dbutils.widgets.text("task_run_id", "")
-dbutils.widgets.text("task_attempt_number", "")
-dbutils.widgets.text("job_start_time", "")
-dbutils.widgets.text("job_trigger_type", "")
-dbutils.widgets.text("notebook_path", "")
-dbutils.widgets.text("run_as_user_name", "")
+dbutils.widgets.text("correlation_id", "")
 
 dbutils.widgets.dropdown("run_failure_demos", "false", ["false", "true"])
 dbutils.widgets.dropdown("run_rules_engine_demo", "false", ["false", "true"])
-dbutils.widgets.dropdown("require_persistence", "false", ["false", "true"])
-dbutils.widgets.dropdown("validate_sink", "false", ["false", "true"])
 dbutils.widgets.dropdown("strict_logging", "false", ["false", "true"])
 dbutils.widgets.text("demo_target_table", "")
 dbutils.widgets.text("rules_engine_schema", "")
@@ -82,26 +65,37 @@ dbutils.widgets.text("ruleset_version", "")
 # MAGIC This is the standard notebook entry point:
 # MAGIC
 # MAGIC ```python
-# MAGIC event_logger = observe_notebook.from_widgets(dbutils=dbutils, spark=spark)
+# MAGIC event_logger = observe_notebook(spark=spark, dbutils=dbutils)
 # MAGIC ```
 # MAGIC
-# MAGIC It reads widgets, resolves runtime context, sets the default logger, and emits
-# MAGIC `notebook.started`.
+# MAGIC Inputs are explicit. The function resolves Databricks runtime context, sets
+# MAGIC the default logger, and emits `notebook.started`.
 
 # COMMAND ----------
 
-from databricks_event_logger import get_default_logger, observe_notebook, observed
+from databricks_event_logger import (
+    ConsoleSink,
+    DeltaSink,
+    get_default_logger,
+    observe_notebook,
+    observed,
+)
 from databricks_event_logger.spark import count_rows, run_sql, validate_row_count, write_delta
 
-require_persistence = dbutils.widgets.get("require_persistence").strip().lower() == "true"
-validate_sink = dbutils.widgets.get("validate_sink").strip().lower() == "true"
 strict_logging = dbutils.widgets.get("strict_logging").strip().lower() == "true"
+event_table = dbutils.widgets.get("observability_event_table").strip()
+sink = DeltaSink(spark=spark, table_name=event_table) if event_table else ConsoleSink()
+if isinstance(sink, DeltaSink):
+    sink.validate()
 
-event_logger = observe_notebook.from_widgets(
-    dbutils=dbutils,
+event_logger = observe_notebook(
     spark=spark,
-    require_persistence=require_persistence,
-    validate_sink=validate_sink,
+    dbutils=dbutils,
+    app_name=dbutils.widgets.get("app_name"),
+    component=dbutils.widgets.get("component"),
+    environment=dbutils.widgets.get("environment"),
+    correlation_id=dbutils.widgets.get("correlation_id").strip() or None,
+    sink=sink,
     strict_logging=strict_logging,
     default_metadata={
         "guide": "databricks_event_logger_developer_guide",
@@ -109,7 +103,7 @@ event_logger = observe_notebook.from_widgets(
 )
 
 print(f"sink: {type(event_logger.sink).__name__}")
-print(f"event table: {event_logger.config.event_table}")
+print(f"event table: {getattr(event_logger.sink, 'table_name', None)}")
 print(f"app_name: {event_logger.config.app_name}")
 print(f"component: {event_logger.config.component}")
 print(f"environment: {event_logger.config.environment}")
@@ -127,7 +121,7 @@ print(f"job_run_url: {event_logger.job_run_url}")
 # MAGIC ## 3. Verify Default Logger
 # MAGIC
 # MAGIC The module-level `@observed(...)` decorator uses the default logger. Calling
-# MAGIC `observe_notebook.from_widgets(...)` configured it.
+# MAGIC `observe_notebook(...)` configured it.
 
 # COMMAND ----------
 
@@ -140,7 +134,7 @@ event_logger.record_event(
     severity="info",
     metadata={
         "sink": type(event_logger.sink).__name__,
-        "event_table": event_logger.config.event_table,
+        "event_table": getattr(event_logger.sink, "table_name", None),
     },
 )
 
@@ -236,6 +230,7 @@ demo_df = spark.createDataFrame(transformed_rows)
 
 demo_row_count = count_rows(
     demo_df,
+    spark=spark,
     event_name="developer_guide.demo_dataframe_counted",
     table_name="developer_guide.demo_df",
     action="count",
@@ -275,7 +270,11 @@ event_logger.record_metric(
 
 # COMMAND ----------
 
-large_count = demo_df.where(F.col("amount_bucket") == "large").count()
+large_count = count_rows(
+    demo_df.where(F.col("amount_bucket") == "large"),
+    spark=spark,
+    event_name="developer_guide.large_bucket_counted",
+)
 
 event_logger.record_event(
     "developer_guide.large_bucket_checked",
@@ -358,10 +357,12 @@ if demo_target_table:
 
     run_sql(
         f"REFRESH TABLE {demo_target_table}",
+        spark=spark,
         metadata={"reason": "developer guide write verification"},
     )
     confirmed_row_count = validate_row_count(
         demo_target_table,
+        spark=spark,
         expected_exact=demo_row_count,
         metadata={"validation_name": "demo_target_row_count"},
     )
@@ -546,23 +547,15 @@ else:
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 14. Inspect In-Memory Events
+# MAGIC ## 14. Understand Console Output
 # MAGIC
-# MAGIC If the sink is `MemorySink`, events are available only in this Python process.
-# MAGIC This is useful for tests and interactive debugging.
+# MAGIC `ConsoleSink` prints one JSON event per line in notebook output. It is the
+# MAGIC library default and requires no storage configuration. Use `MemorySink`
+# MAGIC explicitly in unit tests when assertions need access to emitted events.
 
 # COMMAND ----------
 
-if type(event_logger.sink).__name__ == "MemorySink":
-    import json
-
-    memory_events = [
-        (json.dumps(event.as_json_dict(), sort_keys=True),)
-        for event in event_logger.sink.events
-    ]
-    display(spark.createDataFrame(memory_events, ["event_json"]))
-else:
-    print("Current sink is not MemorySink; events are persisted by the configured sink.")
+print(f"Current sink: {type(event_logger.sink).__name__}")
 
 # COMMAND ----------
 
@@ -572,8 +565,6 @@ else:
 # MAGIC If the sink is `DeltaSink`, query the configured event table.
 
 # COMMAND ----------
-
-event_table = (event_logger.config.event_table or "").strip()
 
 if event_table and type(event_logger.sink).__name__ == "DeltaSink":
     display(
@@ -677,4 +668,4 @@ else:
 # MAGIC - Conditional severity event is `warning` when large rows exist.
 # MAGIC - Child events have `parent_event_id`.
 # MAGIC - If `DeltaSink` was used, events are visible in the Delta table.
-# MAGIC - If `MemorySink` was used, events are visible only in memory.
+# MAGIC - If `ConsoleSink` was used, events appear as JSON in notebook output.
