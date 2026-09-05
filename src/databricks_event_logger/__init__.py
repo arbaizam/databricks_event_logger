@@ -5,15 +5,11 @@ from databricks_event_logger.event import EventRecord
 from databricks_event_logger.events import (
     EventSeverity,
     EventStatus,
-    EventType,
 )
 from databricks_event_logger.logger import (
     DeliveryHealth,
     EventLogger,
     EventScope,
-    get_default_logger,
-    observed,
-    use_logger,
 )
 from databricks_event_logger.sinks.base import EventSink
 from databricks_event_logger.sinks.console import ConsoleSink
@@ -31,12 +27,8 @@ __all__ = [
     "EventSeverity",
     "EventSink",
     "EventStatus",
-    "EventType",
     "MemorySink",
     "RuntimeContext",
     "__version__",
     "create_table_sql",
-    "get_default_logger",
-    "observed",
-    "use_logger",
 ]

@@ -6,6 +6,7 @@ import math
 from dataclasses import dataclass, field, fields
 from datetime import date, datetime, timezone
 from enum import Enum
+from numbers import Integral, Real
 from typing import Any
 from uuid import uuid4
 
@@ -105,14 +106,16 @@ class EventRecord:
 
         for name in ("row_count", "duration_ms"):
             value = getattr(self, name)
-            if value is not None and (
-                isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= MAX_INT64
-            ):
+            if value is None:
+                continue
+            if isinstance(value, bool) or not isinstance(value, Integral):
                 raise ValueError(f"{name} must be an integer from 0 through {MAX_INT64}.")
+            value = int(value)
+            if not 0 <= value <= MAX_INT64:
+                raise ValueError(f"{name} must be an integer from 0 through {MAX_INT64}.")
+            object.__setattr__(self, name, value)
         if self.metric_value is not None:
-            if isinstance(self.metric_value, bool) or not isinstance(
-                self.metric_value, int | float,
-            ):
+            if isinstance(self.metric_value, bool) or not isinstance(self.metric_value, Real):
                 raise ValueError("metric_value must be a finite number.")
             try:
                 metric = float(self.metric_value)

@@ -2,20 +2,14 @@ import asyncio
 import json
 import warnings
 from concurrent.futures import ThreadPoolExecutor
-from contextvars import Context
+from contextvars import copy_context
 from dataclasses import FrozenInstanceError
-from threading import Lock
+from threading import Barrier, Lock
 
 import pytest
 
 from databricks_event_logger.context import RuntimeContext
-from databricks_event_logger.errors import EventLoggerConfigurationError
-from databricks_event_logger.logger import (
-    EventLogger,
-    get_default_logger,
-    observed,
-    use_logger,
-)
+from databricks_event_logger.logger import EventLogger
 from databricks_event_logger.sinks.memory import MemorySink
 
 
@@ -50,6 +44,24 @@ def test_direct_events_stamp_identity_and_normalize_numeric_metrics():
     assert metric.metric_value == 7.0
     assert isinstance(metric.metric_value, float)
     assert (logger.health.attempted, logger.health.succeeded, logger.health.failed) == (2, 2, 0)
+
+
+def test_numpy_scalars_work_through_direct_metrics_and_editable_scope_apis():
+    np = pytest.importorskip("numpy")
+    logger = EventLogger(sink=MemorySink())
+    direct = logger.record_event("count", row_count=np.int64(5))
+    metric = logger.record_metric("rows", np.int64(5))
+    floating = logger.record_metric("ratio", np.float32(1.5))
+    with logger.event("scoped", row_count=np.int64(0)) as scope:
+        scope.row_count = np.uint32(7)
+    scoped = logger.sink.events[-1]
+    assert direct.row_count == 5
+    assert scoped.row_count == 7
+    assert type(direct.row_count) is type(scoped.row_count) is int
+    assert metric.metric_value == 5.0
+    assert floating.metric_value == 1.5
+    assert type(metric.metric_value) is type(floating.metric_value) is float
+    assert logger.health.succeeded == 4
 
 
 def test_default_correlation_is_independent_of_databricks_identity():
@@ -136,6 +148,55 @@ def test_bound_metadata_and_scope_inputs_have_independent_top_level_snapshots():
     assert bound.health == logger.health
 
 
+@pytest.mark.parametrize("metadata", [{1: "bad key"}, {"nested": [{1: "bad key"}]}])
+def test_default_metadata_content_is_validated_before_logger_construction(metadata):
+    sink = MemorySink()
+    with pytest.raises(TypeError, match="metadata keys must be strings"):
+        EventLogger(sink=sink, default_metadata=metadata, metadata_max_bytes=2)
+    assert not sink.events
+
+
+def test_bound_metadata_is_validated_after_merging_without_attempting_delivery():
+    logger = EventLogger(sink=MemorySink(), default_metadata={"batch": "one"})
+    with pytest.raises(TypeError, match="metadata keys must be strings"):
+        logger.bind(nested={1: "bad key"})
+    assert logger.default_metadata == {"batch": "one"}
+    assert logger.health.attempted == 0
+    assert not logger.sink.events
+
+
+def test_bound_metadata_revalidates_inherited_values_after_external_mutation():
+    nested = {"valid": "one"}
+    logger = EventLogger(sink=MemorySink(), default_metadata={"nested": nested})
+    nested[1] = "bad key"
+    with pytest.raises(TypeError, match="metadata keys must be strings"):
+        logger.bind(batch="one")
+    assert logger.health.attempted == 0
+    # Later mutations stay caller-owned; event delivery uses the normal failure policy.
+    with pytest.warns(RuntimeWarning):
+        assert logger.record_event("after-mutation") is None
+    assert logger.health.failed == 1
+
+
+def test_metadata_validation_uses_configured_redaction_without_replacing_raw_defaults():
+    sink = MemorySink()
+    logger = EventLogger(
+        sink=sink,
+        default_metadata={"team_private": {1: "redacted before traversal"}, "batch": "one"},
+        redact_keys=("team_private",),
+        metadata_string_max_chars=3,
+        metadata_max_bytes=None,
+    )
+    child = logger.bind(team_private={2: "also redacted before traversal"}, label="abcdef")
+    event = child.record_event("checkpoint")
+    assert child.default_metadata["label"] == "abcdef"
+    assert json.loads(event.metadata_json) == {
+        "team_private": "[REDACTED]",
+        "batch": "one",
+        "label": "...",
+    }
+
+
 def test_health_is_an_immutable_snapshot_and_retains_last_failure():
     sink = FailingSink()
     logger = EventLogger(sink=sink)
@@ -198,6 +259,36 @@ def test_strict_delivery_failure_is_raised_once_after_work_and_parent_is_restore
     assert completed == [True]
     assert (logger.health.attempted, logger.health.failed) == (1, 1)
     logger.sink = MemorySink()
+    assert logger.record_event("after").parent_event_id is None
+
+
+def test_nested_strict_failure_aborts_outer_work_and_records_its_failed_outcome():
+    error = RuntimeError("inner event delivery unavailable")
+
+    class FailInnerSink(MemorySink):
+        def emit(self, event):
+            if event.event_name == "inner":
+                raise error
+            super().emit(event)
+
+    sink = FailInnerSink()
+    logger = EventLogger(sink=sink, strict_logging=True)
+    completed = []
+    with pytest.raises(RuntimeError) as captured:
+        with logger.event("outer"):
+            with logger.event("inner"):
+                completed.append("inner")
+            completed.append("remaining outer work")
+    assert captured.value is error
+    assert completed == ["inner"]
+    (outer,) = sink.events
+    assert outer.event_name == "outer"
+    assert outer.status == "failed"
+    assert outer.severity == "error"
+    assert outer.error_class == "RuntimeError"
+    assert outer.error_message == str(error)
+    assert outer.parent_event_id is None
+    assert (logger.health.attempted, logger.health.succeeded, logger.health.failed) == (2, 1, 1)
     assert logger.record_event("after").parent_event_id is None
 
 
@@ -278,6 +369,44 @@ def test_bound_loggers_share_consistent_health_across_threads():
     health = logger.health
     assert health.attempted == health.succeeded == 240
     assert health.failed == 0
+
+
+@pytest.mark.parametrize("propagate_context", [False, True])
+def test_logger_bound_decorators_run_in_threads_with_explicit_parent_propagation(
+    propagate_context,
+):
+    sink = MemorySink()
+    logger = EventLogger(sink=sink)
+    ready = Barrier(3)
+
+    @logger.logged_event("table.load")
+    def load(index):
+        ready.wait(timeout=10)
+        logger.record_event(f"checkpoint.{index}")
+        return f"loaded {index}"
+
+    with logger.event("parent") as parent:
+        with ThreadPoolExecutor(max_workers=3) as pool:
+            futures = [
+                pool.submit(copy_context().run, load, index)
+                if propagate_context
+                else pool.submit(load, index)
+                for index in range(3)
+            ]
+            assert [future.result(timeout=10) for future in futures] == [
+                "loaded 0", "loaded 1", "loaded 2",
+            ]
+        assert logger.record_event("same-thread-child").parent_event_id == parent.event_id
+    operations = [event for event in sink.events if event.event_name == "table.load"]
+    assert len(operations) == 3
+    assert all(event.status == "success" for event in operations)
+    expected_parent = parent.event_id if propagate_context else None
+    assert all(event.parent_event_id == expected_parent for event in operations)
+    checkpoints = [event for event in sink.events if event.event_name.startswith("checkpoint.")]
+    assert {event.parent_event_id for event in checkpoints} == {
+        event.event_id for event in operations
+    }
+    assert logger.record_event("after").parent_event_id is None
 
 
 def test_failure_overrides_edited_status_and_captures_bounded_frames_without_locals():
@@ -443,39 +572,57 @@ def test_generator_functions_are_rejected_before_lazy_work_is_misreported():
         yield 1
 
     for function in (generator, async_generator):
-        with pytest.raises(TypeError, match="Generator functions"):
+        with pytest.raises(TypeError, match="scope around the consuming loop"):
             logger.logged_event("generator")(function)
-        with pytest.raises(TypeError, match="Generator functions"):
-            observed("generator")(function)
-        with pytest.raises(TypeError, match="Generator functions"):
+        with pytest.raises(TypeError, match="scope around the consuming loop"):
             logger.run_task("generator", function)
     assert not logger.sink.events
 
 
-def test_scoped_default_is_resolved_on_call_and_restored_even_after_failure():
-    first, second = EventLogger(sink=MemorySink()), EventLogger(sink=MemorySink())
+def test_consumer_scope_completes_when_loop_breaks_without_closing_generator():
+    logger = EventLogger(sink=MemorySink())
 
-    @observed("operation")
-    def operation():
-        return "done"
+    def rows():
+        yield from range(5)
 
-    def scenario():
-        with pytest.raises(EventLoggerConfigurationError, match="use_logger"):
-            operation()
-        with use_logger(first):
-            assert operation() == "done"
-            with pytest.raises(ValueError), use_logger(second):
-                assert get_default_logger() is second
-                operation()
-                raise ValueError("leave inner default")
-            assert get_default_logger() is first
-            operation()
-        with pytest.raises(EventLoggerConfigurationError):
-            get_default_logger()
+    source = rows()
+    seen = []
+    with logger.event("positions.read") as scope:
+        for value in source:
+            seen.append(value)
+            scope.row_count = len(seen)
+            if value == 1:
+                break
+    (event,) = logger.sink.events
+    assert seen == [0, 1]
+    assert event.status == "success"
+    assert event.row_count == 2
+    # Delivery follows the consumer's block, even while iteration remains suspended.
+    assert next(source) == 2
+    assert logger.record_event("after").parent_event_id is None
+    source.close()
+    assert len(logger.sink.events) == 2
 
-    Context().run(scenario)
-    assert len(first.sink.events) == 2
-    assert len(second.sink.events) == 1
+
+def test_consumer_scope_records_iteration_failure_and_preserves_exception():
+    logger = EventLogger(sink=MemorySink())
+    error = ValueError("source failed")
+
+    def rows():
+        yield 1
+        raise error
+
+    with pytest.raises(ValueError) as captured:
+        with logger.event("positions.read") as scope:
+            scope.row_count = 0
+            for _ in rows():
+                scope.row_count += 1
+    assert captured.value is error
+    (event,) = logger.sink.events
+    assert event.status == "failed"
+    assert event.error_class == "ValueError"
+    assert event.row_count == 1
+    assert logger.record_event("after").parent_event_id is None
 
 
 @pytest.mark.parametrize(

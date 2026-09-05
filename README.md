@@ -26,7 +26,8 @@ batch_logger.record_event("positions.ready", row_count=len(positions))
 
 The scope emits one event when it exits. A normal exit records `success`; an
 exception records `failed` and propagates the original exception. Nested scopes
-and direct events record the active scope's ID in `parent_event_id`.
+and direct events on the same logger or its bound loggers inherit the active
+scope's ID as `parent_event_id` within the current execution context.
 
 ## Enrich an operation as it runs
 
@@ -45,14 +46,17 @@ with logger.event("positions.check", metadata={"expected_min": 1}) as event:
 The editable fields are `metadata`, `row_count`, `status`, `severity`,
 `source_table`, and `target_table`. `event_id` is available during the block for
 correlating other records. An exception always produces a failed outcome.
-Use a fresh scope for each operation.
+Use a fresh scope for each operation, entering and exiting it in the same
+execution context. A scope must not span a generator's `yield`.
 
 `logger.bind(**metadata)` returns a logger with additional business context. It
-shares the sink, correlation ID, and delivery health. Top-level metadata changes
-are isolated; nested mutable values remain shared. Event metadata overrides bound
-values. Pass the same explicit `correlation_id` to separate tasks that belong to
-one workflow. An omitted correlation ID becomes a new UUID; it is independent of Databricks run
-identity.
+shares the sink, correlation ID, and delivery health. Construction and binding
+validate the supplied metadata, including its keys. Top-level metadata changes
+are isolated; nested mutable values remain shared. Later nested mutations are
+checked when an event is serialized. Event metadata overrides bound values.
+Pass the same explicit `correlation_id` to separate tasks that belong to one
+workflow. An omitted correlation ID becomes a new UUID; it is independent of
+Databricks run identity.
 
 ## Observe functions
 
@@ -69,13 +73,50 @@ async def fetch_record(client, record_id):
 
 Async decorators await the function before recording its outcome. You can also
 use an ordinary `with logger.event(...)` block inside an async function across
-`await` calls. Generator and async-generator functions are rejected because
-their execution continues during iteration.
+`await` calls. Generator and async-generator decorators are rejected because
+their execution continues during iteration. Wrap the consumer's iteration
+instead, so the scope exits when the consumer finishes or stops early:
 
-For imported application functions that cannot receive a logger directly,
-`@observed("event.name")` resolves the logger installed by `with
-use_logger(logger):` at call time. The previous logger is restored on exit. This
-is optional; explicit logger instances work everywhere.
+```python
+with logger.event("positions.read") as event:
+    event.row_count = 0
+    for position in read_positions():
+        process_position(position)
+        event.row_count += 1
+```
+
+Pass a logger to reusable application code, or wrap an imported callable with
+`logger.logged_event("event.name")(function)`. No ambient default logger is needed.
+
+## Observe work in threads
+
+A logger-bound decorator works in worker threads. Automatic parent tracking is
+context-local: thread-pool submissions do not propagate it. To preserve parent
+relationships, make a **fresh context copy for every submission**:
+
+```python
+from concurrent.futures import ThreadPoolExecutor
+from contextvars import copy_context
+
+
+@logger.logged_event("table.load")
+def load_table(name):
+    return name  # Replace with application work.
+
+
+with logger.event("tables.load"):
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        futures = [
+            pool.submit(copy_context().run, load_table, name)
+            for name in ["positions", "prices", "accounts"]
+        ]
+        results = [future.result() for future in futures]
+```
+
+Without propagation, events are still delivered but have no automatic parent
+from the submitting thread. Do not share one copied context between concurrent
+submissions. For a single direct event, explicitly pass
+`logger.record_event("table.loaded", parent_event_id=parent_id)` instead.
 
 ## Use Delta in Databricks
 
@@ -164,19 +205,33 @@ and `last_error` fields. The last error remains available after later successes.
 `record_event()` returns the emitted `EventRecord`, or `None` after a tolerated
 preparation or delivery failure.
 
-With the default `strict_logging=False`, internal logging failures are recorded
-in health and do not fail business work. Invalid setup and call arguments raise
-before work starts. Editable scope fields are checked on exit; invalid edits
-follow the same preparation-failure policy as other internal logging failures.
+With the default `strict_logging=False`, ordinary preparation and delivery
+errors are recorded in health and do not fail business work. Invalid logger
+configuration, static event fields, or non-mapping metadata raise before work
+starts. Per-event metadata content and editable scope fields are checked at
+delivery; invalid content or edits follow the preparation-failure policy.
 With `strict_logging=True`, a logging failure after successful business work
-raises. An exception already raised by business code is always preserved.
+raises. In nested scopes it aborts the enclosing operation, which therefore
+records a failed outcome too. An exception already raised by business code is
+always preserved.
 
-Metadata is bounded JSON with sensitive-key redaction. Exception messages are
-bounded free text, so avoid putting secrets in exception messages. For useful
-failure locations, enable `capture_error_frames=True` when constructing the
+Metadata is bounded JSON with sensitive-key redaction. Dataclasses, namedtuples,
+and named Spark `Row` values retain field names for recursive redaction. Integral
+and real numeric scalars, including NumPy numbers, normalize without requiring
+NumPy as a runtime dependency. Counts must be nonnegative 64-bit integers;
+metrics must be finite numbers. Booleans are not counts or metrics; NumPy boolean
+metadata values use the unsupported-value marker. JSON escapes non-ASCII text,
+including lone surrogates, so the encoded metadata is safe to transmit as UTF-8.
+
+Exception messages are bounded free text, so avoid putting secrets in exception
+messages. For useful failure locations, enable `capture_error_frames=True` when constructing the
 logger. This stores up to 20 selected frames with file basename, function, and
 line number in `error_frames_json`; it captures neither source text nor local
 variables. `stack_trace_hash` groups the exception type and frame locations.
+
+`event_date` is always derived from the UTC event timestamp. In a non-UTC query
+session, `to_date(event_ts)` can differ near midnight. Use UTC date boundaries
+for partition filters; the logger never changes the application's Spark timezone.
 
 ## Examples and development
 
@@ -188,6 +243,8 @@ variables. `stack_trace_hash` groups the exception type and frame locations.
   and duration summaries.
 - [API and architecture](docs/databricks-event-logger-design-spec.md): the compact
   implementation contract.
+- [Databricks validation](docs/databricks_validation.md): live test instructions
+  and a disposable-table delivery-cost measurement.
 
 ```bash
 python -m pip install -e ".[dev]"
@@ -196,23 +253,10 @@ python -m ruff check .
 python -m build --wheel
 ```
 
-Install `.[dev,spark-test]` to include local PySpark schema tests. The integration
-suite requires an active Databricks Spark session and an explicitly chosen test
-schema:
-
-From a Databricks Python notebook with this repository as its working directory:
-
-```python
-import os
-
-import pytest
-
-os.environ["EVENT_LOGGER_TEST_SCHEMA"] = "main.event_logger_tests"
-result = pytest.main(["tests/integration", "-q"])
-assert result == 0
-```
-
-Run pytest in the notebook's Python process so it can use the active Spark
-session. Integration tests create uniquely named test tables within the chosen
-schema and remove only those generated tables afterward. Without the variable
-or an active session, those tests are skipped.
+The development dependencies include NumPy for scalar interoperability tests;
+the installed package has no runtime dependencies. Install `.[dev,spark-test]`
+to include local PySpark schema tests. Live integration tests require an active
+Databricks Spark session and an explicitly chosen test
+schema; follow the [validation guide](docs/databricks_validation.md). Local tests
+do not establish Unity Catalog permissions, Delta transaction behavior, or
+serverless compatibility.

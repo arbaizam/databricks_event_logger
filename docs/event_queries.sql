@@ -1,5 +1,9 @@
 -- Replace main.observability.event_log with your event table.
 -- Keep a bounded event_date filter so Delta can prune partitions.
+-- Run these examples in a separate SQL query session using UTC. This explicit
+-- query-session setting is not applied by the logger to the application session.
+-- event_date is UTC; to_date(event_ts) in another timezone can differ at midnight.
+SET TIME ZONE 'UTC';
 
 -- One workflow's timeline. Child scopes finish before their parents, so sort by
 -- start time when it exists. Replace the literal with the logger's correlation_id.

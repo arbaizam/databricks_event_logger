@@ -78,6 +78,36 @@ def test_integer_metric_is_normalized_to_double():
     assert type(event.metric_value) is float
 
 
+def test_numpy_numbers_are_normalized_to_storage_primitives():
+    np = pytest.importorskip("numpy")
+    for integer_type in (np.int32, np.int64, np.uint64):
+        event = EventRecord(
+            "positions.count", row_count=integer_type(7),
+            duration_ms=integer_type(12), metric_value=integer_type(7),
+        )
+        assert event.row_count == 7
+        assert event.duration_ms == 12
+        assert type(event.row_count) is int
+        assert type(event.duration_ms) is int
+        assert type(event.metric_value) is float
+        assert event.metric_value == 7.0
+    for float_type in (np.float32, np.float64):
+        event = EventRecord("positions.ratio", metric_value=float_type(1.5))
+        assert type(event.metric_value) is float
+        assert event.metric_value == 1.5
+
+
+def test_numpy_numbers_follow_the_same_validation_rules():
+    np = pytest.importorskip("numpy")
+    for name in ("row_count", "duration_ms"):
+        for value in (np.int64(-1), np.uint64(1 << 63), np.float64(7), np.bool_(True)):
+            with pytest.raises(ValueError, match=name):
+                EventRecord("positions.count", **{name: value})
+    for value in (np.bool_(True), np.float32("inf"), np.float64("nan")):
+        with pytest.raises(ValueError, match="metric_value"):
+            EventRecord("positions.ratio", metric_value=value)
+
+
 @pytest.mark.parametrize("value", [True, "7", float("inf"), float("nan"), 10 ** 400])
 def test_invalid_metrics_are_rejected(value):
     with pytest.raises(ValueError, match="metric_value"):

@@ -19,7 +19,6 @@ from typing import Any, TypeVar, cast
 from uuid import uuid4
 
 from databricks_event_logger.context import RuntimeContext
-from databricks_event_logger.errors import EventLoggerConfigurationError
 from databricks_event_logger.event import EventRecord
 from databricks_event_logger.serialization import (
     DEFAULT_METADATA_MAX_BYTES,
@@ -34,7 +33,6 @@ from databricks_event_logger.timing import elapsed_ms, monotonic_ms, utc_now
 
 F = TypeVar("F", bound=Callable[..., Any])
 T = TypeVar("T")
-_default_logger: ContextVar[EventLogger | None] = ContextVar("event_logger_default", default=None)
 
 
 @dataclass(frozen=True)
@@ -77,7 +75,8 @@ class EventLogger:
     Ordinary preparation/delivery failures warn and return ``None``. Strict mode
     raises them after successful work; an active business exception always wins.
     Bound loggers share delivery health and operation lineage. Independent
-    loggers have independent lineage, even when using the same sink.
+    loggers have independent lineage, even when using the same sink. Lineage is
+    context-local; copy the context explicitly when submitting thread-pool work.
     """
 
     def __init__(
@@ -97,13 +96,6 @@ class EventLogger:
         strict_logging: bool = False,
         capture_error_frames: bool = False,
     ) -> None:
-        # Configuration errors are detected before any business operation starts.
-        serialize_metadata(
-            {},
-            redact_keys=redact_keys,
-            string_max_chars=metadata_string_max_chars,
-            max_bytes=metadata_max_bytes,
-        )
         if error_message_max_chars is not None and (
             type(error_message_max_chars) is not int or error_message_max_chars < 0
         ):
@@ -117,6 +109,13 @@ class EventLogger:
         if not callable(getattr(self.sink, "emit", None)):
             raise TypeError("sink must provide emit(event).")
         self._default_metadata = _copy_metadata(default_metadata)
+        # Validate actual defaults and serialization settings before any work starts.
+        serialize_metadata(
+            self._default_metadata,
+            redact_keys=redact_keys,
+            string_max_chars=metadata_string_max_chars,
+            max_bytes=metadata_max_bytes,
+        )
         self.metadata_max_bytes = metadata_max_bytes
         self.metadata_string_max_chars = metadata_string_max_chars
         self.error_message_max_chars = error_message_max_chars
@@ -125,6 +124,7 @@ class EventLogger:
         self.capture_error_frames = capture_error_frames
         self._delivery = _DeliveryState()
         self._current_event_id: ContextVar[str | None] = ContextVar("event_parent", default=None)
+        # Reuse record validation for identity fields without emitting an event.
         self._new_record("logger.configuration")
 
     @property
@@ -139,9 +139,15 @@ class EventLogger:
         return dict(self._default_metadata)
 
     def bind(self, **metadata: Any) -> EventLogger:
-        """Bind a shallow metadata snapshot while sharing delivery and lineage."""
+        """Validate and bind shallow metadata while sharing delivery and lineage."""
         child = copy(self)
         child._default_metadata = {**self._default_metadata, **metadata}
+        serialize_metadata(
+            child._default_metadata,
+            redact_keys=self.redact_keys,
+            string_max_chars=self.metadata_string_max_chars,
+            max_bytes=self.metadata_max_bytes,
+        )
         return child
 
     def record_event(
@@ -214,7 +220,11 @@ class EventLogger:
         target_table: str | None = None,
         row_count: int | None = None,
     ):
-        """Observe a block and yield editable results. Also usable inside async functions."""
+        """Observe a block and yield editable results, including in async functions.
+
+        Enter and exit in the same context. Never span a generator's ``yield``;
+        put the scope around the consuming loop instead.
+        """
         event = self._new_record(
             event_name,
             event_type=event_type,
@@ -269,6 +279,7 @@ class EventLogger:
         metadata: Mapping[str, Any] | None = None,
     ) -> Callable[[F], F]:
         """Observe a sync/async function; generators must be scoped by their consumer."""
+        # Validate fixed event fields now, before the decorated function can run.
         self._new_record(event_name, event_type=event_type)
         snapshot = _copy_metadata(metadata)
         return lambda func: _decorate(
@@ -401,7 +412,8 @@ def _decorate(func: F, scope_factory: Callable[..., Any]) -> F:
 
     if inspect.isgeneratorfunction(func) or inspect.isasyncgenfunction(func):
         raise TypeError(
-            "Generator functions are not supported; observe their iteration with event()."
+            "Generator functions are not supported; put an event() scope around the "
+            "consuming loop, never across a yield."
         )
     if inspect.iscoroutinefunction(func):
 
@@ -418,43 +430,3 @@ def _decorate(func: F, scope_factory: Callable[..., Any]) -> F:
             return func(*args, **kwargs)
 
     return cast(F, wrapper)
-
-
-@contextmanager
-def use_logger(logger: EventLogger) -> Iterator[EventLogger]:
-    """Install a context-local default logger and restore its predecessor on exit."""
-    if not isinstance(logger, EventLogger):
-        raise TypeError("logger must be an EventLogger.")
-    token = _default_logger.set(logger)
-    try:
-        yield logger
-    finally:
-        _default_logger.reset(token)
-
-
-def get_default_logger() -> EventLogger:
-    logger = _default_logger.get()
-    if logger is None:
-        raise EventLoggerConfigurationError(
-            "No default logger; configure one with use_logger(logger)."
-        )
-    return logger
-
-
-def observed(
-    event_name: str,
-    *,
-    event_type: str = "function",
-    metadata: Mapping[str, Any] | None = None,
-) -> Callable[[F], F]:
-    """Observe a function using the default logger active when it is called."""
-    EventRecord(event_name=event_name, event_type=event_type)
-    snapshot = _copy_metadata(metadata)
-    return lambda func: _decorate(
-        func,
-        lambda: get_default_logger().event(
-            event_name,
-            event_type=event_type,
-            metadata=snapshot,
-        ),
-    )

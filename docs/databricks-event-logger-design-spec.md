@@ -12,12 +12,12 @@ record_event ──────────────────────�
                                      v
 event scope → construct and normalize event → sink.emit(record)
      ^
-logged_event / observed
+logged_event / run_task
 ```
 
-There is one lifecycle implementation. Entering a scope validates static
-arguments, allocates its ID, captures its parent, and starts timing. Exiting
-restores the enclosing scope and emits one final record. Duration uses a
+There is one lifecycle implementation. Creating a scope validates static event
+fields and allocates its ID. Entering captures its parent and starts timing.
+Exiting restores the enclosing scope and emits one final record. Duration uses a
 monotonic clock; timestamps are UTC. Exceptions produce a failed record and are
 re-raised unchanged, even when failure-event delivery also fails.
 
@@ -38,8 +38,6 @@ retry loop, automatic start event, or implicit Spark action.
 | `logger.run_task(name, func, *args, ...)` | Calls a function through the same decorator, marking the event type as `task`. Await the result for async functions. |
 | `logger.bind(**metadata)` | Creates an independently enriched logger sharing sink, identity, correlation, parent tracking, and delivery health. Per-event metadata has precedence. |
 | `logger.health` | Immutable attempted/succeeded/failed counters and the last failure text. Counts emission attempts, including internal preparation failures. |
-| `use_logger(logger)` | Installs an optional default logger for its context and restores the previous one on exit. |
-| `observed(name, ...)` | Resolves that default at invocation; supports the same callable kinds as `logged_event`. |
 | `RuntimeContext` | Normalized runtime identity with navigation URL properties. Explicit unknown fields are rejected. |
 | `databricks.resolve_context(dbutils=None, values=None)` | Best-effort notebook JSON discovery followed by explicit canonical overrides, including explicit `None`. |
 | `ConsoleSink`, `MemorySink`, `DeltaSink` | Implement `emit(EventRecord)`. Memory retains records for application tests. |
@@ -52,8 +50,10 @@ Strings are accepted for event names and types. Supported statuses are `started`
 exceptions override the outcome to `failed`. Use a direct `started` event only
 when the application explicitly needs one.
 
-Counts must be nonnegative signed 64-bit integers. Metric values must be finite
-numbers and normalize to floating point. Event identity, timestamps, runtime
+Counts must be nonnegative signed 64-bit integers. Integral and real numeric
+scalars, including NumPy numbers, normalize to built-in integers and floats
+without a NumPy runtime dependency. Boolean counts and metrics are rejected.
+Metric values must be finite. Event identity, timestamps, runtime
 fields, table names, metrics, error details, and metadata serialize to one flat
 row through `EventRecord.as_dict()`.
 
@@ -71,23 +71,40 @@ row through `EventRecord.as_dict()`.
 - `sinks/` owns delivery. The Delta adapter has one explicit storage schema that
   supplies column ordering, Spark types, validation, and generated DDL.
 
-Invalid setup and call arguments raise a validation error before work starts.
-Editable scope fields are validated at exit; invalid edits are preparation
-failures. Internal preparation or sink failures increment failed delivery health.
-In default mode they do not fail business execution; in strict mode they propagate if execution has not
-already failed. Diagnostics must never replace an active business exception or
-leave an abandoned scope installed.
+Invalid logger configuration, static event fields, and non-mapping metadata
+raise a validation error before work starts.
+Construction and `bind()` validate actual metadata content, including keys.
+Per-event metadata content and editable scope fields are validated at delivery;
+invalid content or edits are preparation failures. Preparation or sink failures
+increment failed delivery health. Ordinary errors do not fail business execution
+in default mode; in strict mode they propagate if execution has not already
+failed. A strict delivery failure in an inner scope aborts the enclosing
+operation; its failed outcome correctly records that interruption. Diagnostics
+must never replace an active business exception. Scope entry and exit must occur
+in the same execution context so the parent can be restored.
 
 Binding copies the top-level metadata mapping; adding or replacing keys does not
 mutate the original logger. Nested mutable values remain shared until event
-serialization. Parent tracking is context-local. Work observed across `await`
-uses the same ordinary scope; async decorators await the complete function.
+serialization, when later edits are checked under the preparation-failure policy.
+Parent tracking is context-local, shared by a logger and its bound loggers.
+Unrelated loggers have independent parents. Thread-pool work logs normally but
+needs a fresh `copy_context()` per submission to inherit the submitting thread's
+parent. Alternatively, direct events accept an explicit `parent_event_id`.
+
+Work observed across `await` uses the same ordinary scope; async decorators await
+the complete function. Scopes must not span a generator's `yield`: wrap consumer
+iteration instead. Generator and async-generator decorators are rejected. Logger
+instances are explicit; there is no ambient default-logger API.
 
 ## Error details and storage
 
 Exception messages are truncated free text, not a guarantee of secret removal.
 Metadata redaction applies to sensitive keys and cannot infer every secret in
 arbitrary text. Prefer selected operational metadata over raw request bodies.
+Namedtuples and named Spark `Row` values preserve their field names before
+redaction; malformed named records use the unsupported marker. NumPy booleans
+are unsupported metadata values. JSON uses ASCII escaping, including for lone
+surrogates, so emitted metadata remains UTF-8 encodable.
 
 With `capture_error_frames=True`, the record includes a bounded JSON array of
 up to 20 frames containing file basename, function, and line. No source lines or
@@ -98,8 +115,13 @@ Delta delivery creates a typed one-row temporary view, inserts into the
 pre-existing destination with explicit columns, and removes the view. Required
 columns and exact types must match. Nullable record fields must accept nulls;
 additional destination columns must be nullable. Table provisioning is explicit.
+The `event_date` partition is the UTC date of `event_ts`; it can differ from
+`to_date(event_ts)` in a non-UTC query session. The logger does not change the
+application's Spark timezone.
 
 Unit tests cover the public behavior and failure boundaries. Opt-in Databricks
 integration tests exercise actual inserts and schema checks using only generated
 tables within `EVENT_LOGGER_TEST_SCHEMA`. Local fake Spark tests cannot establish
-runtime permissions or persistence behavior.
+runtime permissions or persistence behavior. See the
+[Databricks validation guide](databricks_validation.md) for live execution and a
+small measurement of per-event latency, history commits, and active data files.

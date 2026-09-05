@@ -6,11 +6,18 @@ EVENT_LOGGER_TEST_SCHEMA=catalog.disposable_schema. No existing tables are modif
 
 import json
 import os
+from datetime import date, datetime, timezone
 from uuid import uuid4
 
 import pytest
 
-from databricks_event_logger import DeltaSink, EventLogger, RuntimeContext, create_table_sql
+from databricks_event_logger import (
+    DeltaSink,
+    EventLogger,
+    EventRecord,
+    RuntimeContext,
+    create_table_sql,
+)
 from databricks_event_logger.errors import EventLoggerConfigurationError
 
 pytestmark = pytest.mark.integration
@@ -81,6 +88,23 @@ def test_added_nullable_column_and_reordered_columns_are_supported(spark_session
     assert row.event_name == "schema.order"
     assert row.status == "warning"
     assert row.team_note is None
+
+
+def test_partition_date_is_utc_in_a_non_utc_session(spark_session, event_table):
+    # A separate session keeps this test from changing the notebook's timezone.
+    session = spark_session.newSession()
+    session.conf.set("spark.sql.session.timeZone", "America/Chicago")
+    DeltaSink(session, event_table).emit(EventRecord(
+        "utc.midnight", event_ts=datetime(2026, 9, 5, 0, 30, tzinfo=timezone.utc),
+    ))
+    row = session.sql(
+        f"SELECT event_date, to_date(event_ts) AS local_date, "
+        f"date_format(event_ts, 'yyyy-MM-dd HH:mm:ss') AS local_time "
+        f"FROM {event_table} WHERE event_date = DATE '2026-09-05'"
+    ).first()
+    assert row.event_date == date(2026, 9, 5)
+    assert row.local_date == date(2026, 9, 4)
+    assert row.local_time == "2026-09-04 19:30:00"
 
 
 def test_incompatible_schema_is_detected_before_delivery(spark_session, event_table):

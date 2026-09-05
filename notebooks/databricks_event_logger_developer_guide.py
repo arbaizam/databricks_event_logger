@@ -10,7 +10,7 @@
 
 import json
 
-from databricks_event_logger import EventLogger, MemorySink, observed, use_logger
+from databricks_event_logger import EventLogger, MemorySink
 
 sink = MemorySink()
 logger = EventLogger(
@@ -58,8 +58,8 @@ with batch_logger.event("positions.optional_enrichment") as event:
 # MAGIC %md
 # MAGIC ## Observe a function
 # MAGIC
-# MAGIC Use an instance decorator when a logger is available. For imported code,
-# MAGIC an optional scoped default resolves at invocation and is restored on exit.
+# MAGIC Use a logger-bound decorator. Pass the logger to reusable application code,
+# MAGIC or wrap an imported function with `logger.logged_event(name)(function)`.
 
 # COMMAND ----------
 
@@ -69,15 +69,34 @@ def total_amount(rows):
     return sum(row["amount"] for row in rows)
 
 
-@observed("positions.format")
+@batch_logger.logged_event("positions.format")
 def format_total(total):
     return f"Total: {total:.2f}"
 
 
-with use_logger(batch_logger):
-    summary = format_total(total_amount(positions))
+summary = format_total(total_amount(positions))
 
 print(summary)
+
+# COMMAND ----------
+# MAGIC %md
+# MAGIC ## Observe iteration from the consumer
+# MAGIC
+# MAGIC Enter and exit scopes in the same execution context. A scope must not span
+# MAGIC a generator's `yield`; put it around consumer iteration instead. Stopping
+# MAGIC early then closes the scope promptly without recording a false failure.
+
+# COMMAND ----------
+
+with batch_logger.event("positions.read") as event:
+    event.row_count = 0
+    for position in (row for row in positions):
+        event.row_count += 1
+        if position["id"] == 1:
+            break
+
+assert sink.events[-1].status == "success"
+assert sink.events[-1].row_count == 1
 
 # COMMAND ----------
 # MAGIC %md

@@ -1,9 +1,8 @@
 """
-Suggested event types and supported statuses and severities.
+Supported statuses and severities.
 
-The package still accepts plain strings so teams can define domain-specific
-event names and event types. These constants cover common SDK values and reduce
-typos at notebook and package call sites.
+These constants reduce typos at notebook and package call sites. Event names
+and event types are caller-defined strings.
 """
 
 from __future__ import annotations
@@ -39,18 +38,3 @@ class EventSeverity(str, Enum):
     WARNING = "warning"
     ERROR = "error"
     CRITICAL = "critical"
-
-
-class EventType(str, Enum):
-    """
-    Common event type values.
-
-    Event types remain caller-configurable; these constants are the recommended
-    shared vocabulary for common SDK and notebook operations.
-    """
-
-    TASK = "task"
-    FUNCTION = "function"
-    VALIDATION = "validation"
-    METRIC = "metric"
-    CUSTOM = "custom"

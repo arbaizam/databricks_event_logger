@@ -6,7 +6,13 @@ from types import SimpleNamespace
 
 import pytest
 
-from databricks_event_logger import ConsoleSink, DeltaSink, MemorySink, create_table_sql
+from databricks_event_logger import (
+    ConsoleSink,
+    DeltaSink,
+    EventLogger,
+    MemorySink,
+    create_table_sql,
+)
 from databricks_event_logger.errors import EventLoggerConfigurationError
 from databricks_event_logger.event import EventRecord
 from databricks_event_logger.sinks.delta import EVENT_COLUMNS, EVENT_SCHEMA, _event_schema
@@ -28,6 +34,23 @@ def test_console_sink_writes_one_json_line():
     assert data["event_name"] == "positions.publish"
     assert data["metric_value"] == 7.0
     assert "context" not in data
+
+
+@pytest.mark.parametrize("budget", [None, 120])
+def test_console_sink_delivers_surrogate_metadata_through_strict_utf8_stdout(monkeypatch, budget):
+    buffer = io.BytesIO()
+    stream = io.TextIOWrapper(buffer, encoding="utf-8", errors="strict")
+    monkeypatch.setattr("sys.stdout", stream)
+    logger = EventLogger(metadata_max_bytes=budget, strict_logging=True)
+
+    event = logger.record_event("paths.read", metadata={"path\ud800": "file\udcff", "text": "😀"})
+
+    stream.flush()
+    data = json.loads(buffer.getvalue().decode("utf-8"))
+    metadata = json.loads(data["metadata_json"].encode("utf-8"))
+    assert metadata == {"path\ud800": "file\udcff", "text": "😀"}
+    assert data["event_id"] == event.event_id
+    assert logger.health.succeeded == 1
 
 
 @pytest.mark.parametrize(

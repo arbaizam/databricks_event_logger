@@ -9,6 +9,7 @@ from dataclasses import fields, is_dataclass
 from datetime import date, datetime
 from decimal import Decimal
 from enum import Enum
+from numbers import Integral, Real
 from pathlib import Path
 from typing import Any
 
@@ -46,7 +47,8 @@ def sanitize_metadata(
     """Convert supported values while recursively applying key redaction.
 
     Supported extensions to JSON are dates, decimals, paths, enums, dataclass
-    instances and tuples. Unknown objects, sets, and excessive depth become
+    instances, named records, tuples, and real numeric scalars. Unknown objects,
+    sets, malformed named records, and excessive depth become
     fixed markers. Mapping keys must be strings. Key redaction is a heuristic,
     so callers remain responsible for excluding secrets from free text.
     """
@@ -75,6 +77,17 @@ def sanitize_metadata(
             return normalize(value.value, depth + 1)
         if is_dataclass(value) and not isinstance(value, type):
             value = {item.name: getattr(value, item.name) for item in fields(value)}
+        if isinstance(value, tuple) and (hasattr(value, "_fields") or hasattr(value, "__fields__")):
+            # Named tuples and PySpark Rows carry keys that must survive redaction.
+            names = getattr(value, "_fields", getattr(value, "__fields__", None))
+            if (
+                not isinstance(names, list | tuple)
+                or len(names) != len(value)
+                or any(not isinstance(name, str) for name in names)
+                or len(set(names)) != len(names)
+            ):
+                return UNSUPPORTED_VALUE
+            value = dict(zip(names, value, strict=True))
         if isinstance(value, Mapping):
             result = {}
             for key, child in value.items():
@@ -94,9 +107,12 @@ def sanitize_metadata(
             value = str(value)
         if isinstance(value, str):
             return _truncate_string(value, string_max_chars)
-        if value is None or isinstance(value, bool | int):
+        if value is None or isinstance(value, bool):
             return value
-        if isinstance(value, float):
+        if isinstance(value, Integral):
+            return int(value)
+        if isinstance(value, Real):
+            value = float(value)
             return value if math.isfinite(value) else "[NONFINITE]"
         return UNSUPPORTED_VALUE
 
@@ -134,7 +150,7 @@ def serialize_metadata(
         marker = _encode({"_truncated": True})
         return marker if len(marker.encode("utf-8")) <= max_bytes else "{}"
     # Binary search the preview length because JSON escaping changes its size.
-    left, right = 0, len(serialized)
+    left, right = 0, min(len(serialized), max_bytes)
     bounded = _encode(summary)
     while left <= right:
         middle = (left + right) // 2
@@ -147,19 +163,9 @@ def serialize_metadata(
     return bounded
 
 
-def deserialize_metadata(metadata_json: str | None) -> dict[str, Any]:
-    """Read the metadata object from an event; empty input returns ``{}``."""
-    if metadata_json is None:
-        return {}
-    result = json.loads(metadata_json)
-    if not isinstance(result, dict):
-        raise ValueError("metadata JSON must contain an object.")
-    return result
-
-
 def _encode(value: Any) -> str:
     return json.dumps(
-        value, ensure_ascii=False, allow_nan=False, sort_keys=True, separators=(",", ":"),
+        value, ensure_ascii=True, allow_nan=False, sort_keys=True, separators=(",", ":"),
     )
 
 

@@ -16,6 +16,7 @@ dependencies = []
 [project.optional-dependencies]
 dev = [
   "build",
+  "numpy",
   "pytest",
   "ruff"
 ]
