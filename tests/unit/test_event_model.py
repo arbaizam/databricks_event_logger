@@ -1,86 +1,100 @@
-from datetime import datetime, timezone
-from decimal import Decimal
+from dataclasses import FrozenInstanceError, replace
+from datetime import datetime, timedelta, timezone
+
+import pytest
 
 from databricks_event_logger.context import RuntimeContext
 from databricks_event_logger.event import EventRecord
-from databricks_event_logger.serialization import deserialize_metadata
+from databricks_event_logger.events import EventSeverity, EventStatus
 
 
-def test_event_record_serializes_metadata_and_context():
-    """
-    What: Builds one flat event record with metadata and Databricks context.
-    Why: Sinks and dashboard tables depend on stable event row fields.
-    Fails when: Metadata JSON, context stamping, or date derivation regresses.
-    """
+def test_event_snapshot_flattens_context_and_preserves_normalized_metadata():
     event = EventRecord(
-        "reporting.step",
-        event_type="business_process",
-        status="success",
-        event_ts=datetime(2026, 6, 3, 12, 0, tzinfo=timezone.utc),
-        app_name="app",
-        component="component",
-        environment="dev",
-        context=RuntimeContext(
-            job_id="job-1",
-            run_id="run-1",
-            task_key="task",
-            task_run_id="task-run-1",
-            task_attempt_number="1",
-            job_start_time="2026-06-03T12:00:00Z",
-            job_trigger_type="one_time",
-            run_as_user_name="svc@example.com",
-        ),
-        metadata={
-            "amount": Decimal("12.30"),
-            "as_of_date": datetime(2026, 6, 3, tzinfo=timezone.utc),
-        },
+        "positions.publish",
+        context=RuntimeContext(job_id=12, run_id="run-1", task_key="publish"),
+        metadata_json='{"count":7}',
     )
 
     row = event.as_dict()
-    metadata = deserialize_metadata(event.metadata_json)
-
-    assert row["event_name"] == "reporting.step"
-    assert row["event_date"].isoformat() == "2026-06-03"
-    assert row["job_id"] == "job-1"
+    assert row["job_id"] == "12"
     assert row["run_id"] == "run-1"
-    assert row["task_key"] == "task"
-    assert row["task_run_id"] == "task-run-1"
-    assert row["task_attempt_number"] == "1"
-    assert row["job_start_time"] == "2026-06-03T12:00:00Z"
-    assert row["job_trigger_type"] == "one_time"
-    assert row["run_as_user_name"] == "svc@example.com"
-    assert metadata["amount"] == "12.30"
-    assert metadata["as_of_date"] == "2026-06-03T00:00:00+00:00"
+    assert row["task_key"] == "publish"
+    assert "context" not in row
+    assert event.context.job_id == "12"
+    assert event.metadata_json == '{"count":7}'
+    with pytest.raises(FrozenInstanceError):
+        event.status = "failed"
 
 
-def test_event_record_json_dict_renders_datetimes_as_text():
-    """
-    What: Converts event timestamps to JSON-safe strings.
-    Why: ConsoleSink and diagnostics need plain JSON-compatible values.
-    Fails when: Datetime values leak into JSON output dictionaries.
-    """
+def test_timestamp_and_partition_date_use_utc():
     event = EventRecord(
-        "reporting.step",
-        event_ts=datetime(2026, 6, 3, 12, 0, tzinfo=timezone.utc),
+        "positions.publish",
+        event_ts=datetime(2026, 6, 3, 23, 30, tzinfo=timezone(timedelta(hours=-5))),
     )
+    assert event.event_ts == datetime(2026, 6, 4, 4, 30, tzinfo=timezone.utc)
+    assert event.as_json_dict()["event_ts"] == "2026-06-04T04:30:00+00:00"
+    assert event.as_json_dict()["event_date"] == "2026-06-04"
 
-    row = event.as_json_dict()
-
-    assert row["event_ts"] == "2026-06-03T12:00:00+00:00"
-    assert row["event_date"] == "2026-06-03"
+    updated = replace(event, event_ts=datetime(2026, 7, 1, tzinfo=timezone.utc))
+    assert updated.event_date.isoformat() == "2026-07-01"
 
 
-def test_event_record_validates_core_fields():
-    """
-    What: Rejects invalid event identity and status fields.
-    Why: Dashboards depend on predictable event names, statuses, and severities.
-    Fails when: Invalid event rows can be constructed.
-    """
-    import pytest
+@pytest.mark.parametrize("field", ["event_ts", "start_ts", "end_ts", "created_at"])
+def test_naive_timestamps_are_rejected(field):
+    with pytest.raises(ValueError, match=field):
+        EventRecord("positions.publish", **{field: datetime(2026, 6, 3)})
 
-    with pytest.raises(ValueError, match="event_name"):
-        EventRecord("")
-    with pytest.raises(ValueError, match="status"):
-        EventRecord("reporting.step", status="done")
-    with pytest.raises(ValueError, match="severity"):
-        EventRecord("reporting.step", severity="urgent")
+
+@pytest.mark.parametrize(
+    ("fields", "error"),
+    [
+        ({"event_name": ""}, "event_name"),
+        ({"event_name": "x" * 256}, "event_name"),
+        ({"event_type": ""}, "event_type"),
+        ({"event_type": "x" * 101}, "event_type"),
+        ({"event_id": ""}, "event_id"),
+        ({"status": "done"}, "status"),
+        ({"status": []}, "status"),
+        ({"severity": "urgent"}, "severity"),
+        ({"source_table": 7}, "source_table"),
+        ({"context": {}}, "context"),
+    ],
+)
+def test_invalid_fields_are_rejected(fields, error):
+    with pytest.raises(ValueError, match=error):
+        EventRecord(**{"event_name": "positions.publish", **fields})
+
+
+@pytest.mark.parametrize("field", ["row_count", "duration_ms"])
+@pytest.mark.parametrize("value", [-1, True, 7.0, 1 << 63, "7"])
+def test_counts_and_durations_must_fit_nonnegative_int64(field, value):
+    with pytest.raises(ValueError, match=field):
+        EventRecord("positions.publish", **{field: value})
+
+
+def test_integer_metric_is_normalized_to_double():
+    event = EventRecord("positions.count", metric_value=7)
+    assert event.metric_value == 7.0
+    assert type(event.metric_value) is float
+
+
+@pytest.mark.parametrize("value", [True, "7", float("inf"), float("nan"), 10 ** 400])
+def test_invalid_metrics_are_rejected(value):
+    with pytest.raises(ValueError, match="metric_value"):
+        EventRecord("positions.count", metric_value=value)
+
+
+def test_status_and_severity_enums_store_strings():
+    event = EventRecord(
+        "positions.validate", status=EventStatus.WARNING, severity=EventSeverity.ERROR,
+    )
+    assert event.status == "warning"
+    assert type(event.status) is str
+    assert event.severity == "error"
+
+
+def test_unknown_arguments_and_raw_metadata_are_rejected():
+    with pytest.raises(TypeError):
+        EventRecord("positions.publish", jobid="123")
+    with pytest.raises(TypeError):
+        EventRecord("positions.publish", metadata={"count": 7})

@@ -1,285 +1,243 @@
 import io
 import json
 import re
-from pathlib import Path
+import warnings
+from types import SimpleNamespace
 
 import pytest
 
-from databricks_event_logger import ConsoleSink, DeltaSink, MemorySink
+from databricks_event_logger import ConsoleSink, DeltaSink, MemorySink, create_table_sql
 from databricks_event_logger.errors import EventLoggerConfigurationError
 from databricks_event_logger.event import EventRecord
-from databricks_event_logger.sinks.delta import EVENT_COLUMNS
+from databricks_event_logger.sinks.delta import EVENT_COLUMNS, EVENT_SCHEMA, _event_schema
 
 
 def test_memory_sink_stores_events_in_order():
-    """
-    What: Stores emitted events in insertion order.
-    Why: Databricks-hosted unit tests use MemorySink for deterministic asserts.
-    Fails when: MemorySink drops or reorders emitted events.
-    """
     sink = MemorySink()
-    first = EventRecord("first")
-    second = EventRecord("second")
-
+    first, second = EventRecord("first"), EventRecord("second")
     sink.emit(first)
     sink.emit(second)
-
     assert sink.events == [first, second]
 
 
 def test_console_sink_writes_one_json_line():
-    """
-    What: Writes one JSON object per emitted event.
-    Why: ConsoleSink should be usable for notebook diagnostics.
-    Fails when: Console output is not valid JSON.
-    """
     stream = io.StringIO()
-    sink = ConsoleSink(stream=stream)
-
-    sink.emit(EventRecord("reporting.step", status="success"))
-
-    payload = json.loads(stream.getvalue())
-    assert payload["event_name"] == "reporting.step"
-    assert payload["status"] == "success"
-
-
-def test_delta_sink_requires_table_name():
-    """
-    What: Rejects an empty Delta table name at sink construction time.
-    Why: Misconfigured persistence should fail before business code starts.
-    Fails when: DeltaSink accepts missing table configuration.
-    """
-    with pytest.raises(EventLoggerConfigurationError, match="table name"):
-        DeltaSink(spark=object(), table_name="")
+    ConsoleSink(stream=stream).emit(EventRecord("positions.publish", metric_value=7))
+    assert len(stream.getvalue().splitlines()) == 1
+    data = json.loads(stream.getvalue())
+    assert data["event_name"] == "positions.publish"
+    assert data["metric_value"] == 7.0
+    assert "context" not in data
 
 
-def test_delta_sink_rejects_unsafe_table_name():
-    """
-    What: Rejects table names that are not simple three-part UC identifiers.
-    Why: DeltaSink interpolates the table identifier into SQL and must fail closed.
-    Fails when: Widget-sourced table names can inject arbitrary SQL.
-    """
-    with pytest.raises(EventLoggerConfigurationError, match="three-part"):
-        DeltaSink(
-            spark=object(),
-            table_name="catalog.schema.event_log; DROP TABLE catalog.schema.event_log",
-        )
+@pytest.mark.parametrize(
+    "name", ["", None, "table", "a.b.c; DROP TABLE a.b.c", "a.b.c\nDROP TABLE x"],
+)
+def test_delta_sink_and_ddl_reject_invalid_identifiers(name):
+    with pytest.raises(EventLoggerConfigurationError):
+        DeltaSink(spark=object(), table_name=name)
+    with pytest.raises(EventLoggerConfigurationError):
+        create_table_sql(name)
 
 
-def test_delta_sink_inserts_through_sql_with_typed_staging_view():
-    """
-    What: Stages one typed event row and inserts it into an existing table via SQL.
-    Why: SQL DDL owns table nullability, and DeltaSink must not create tables from PySpark.
-    Fails when: DeltaSink goes back to DataFrameWriter.saveAsTable or inferred schemas.
-    """
+def test_delta_sink_requires_spark():
+    with pytest.raises(EventLoggerConfigurationError, match="Spark"):
+        DeltaSink(None, "catalog.schema.events")
+
+
+def test_deployment_ddl_matches_flat_event_columns():
+    ddl = create_table_sql("catalog.schema.events")
+    columns = re.findall(r"^  ([a-z_]+) ", ddl, re.MULTILINE)
+    assert columns == list(EVENT_COLUMNS)
+    assert set(columns) == EventRecord("example").as_dict().keys()
+    assert "metric_value DOUBLE" in ddl
+    assert "row_count BIGINT" in ddl
+    assert "event_ts TIMESTAMP NOT NULL" in ddl
+    assert "error_frames_json STRING" in ddl
+    assert "USING DELTA" in ddl
+    assert "PARTITIONED BY (event_date)" in ddl
+
+
+def test_delta_sink_stages_a_verified_typed_row_and_collects_insert_result():
     pytest.importorskip("pyspark")
-    spark = _FakeSpark()
-    sink = DeltaSink(spark=spark, table_name="catalog.schema.event_log")
-    event = EventRecord("reporting.delta_write", metadata={"rows": 10})
+    spark = FakeSpark()
+    event = EventRecord("positions.publish", metric_value=7, metadata_json='{"count":10}')
 
-    sink.emit(event)
+    DeltaSink(spark, "catalog.schema.events").emit(event)
 
-    assert spark.data[0]["event_name"] == "reporting.delta_write"
-    assert spark.schema["event_name"].nullable is False
-    assert spark.schema["task_run_id"].nullable is True
-    assert spark.schema["job_trigger_type"].nullable is True
-    assert spark.schema["metadata_json"].nullable is True
-    assert spark.dataframe.view_name.startswith("databricks_event_logger_event_")
-    assert spark.sql_calls[0].startswith("INSERT INTO catalog.schema.event_log")
-    assert "event_name, event_type, status, event_id" in spark.sql_calls[0]
-    assert spark.sql_calls[1].startswith("DROP VIEW IF EXISTS databricks_event_logger_event_")
+    from pyspark.sql.types import _make_type_verifier
 
-
-def test_delta_sink_validate_checks_required_columns():
-    """
-    What: Validates that a configured event table exposes the v1 event columns.
-    Why: Production bootstrap should fail before business code runs when schema is wrong.
-    Fails when: validate_sink=True cannot detect missing event-log columns.
-    """
-    spark = _DescribeSpark(columns=["event_name"])
-    sink = DeltaSink(spark=spark, table_name="catalog.schema.event_log")
-
-    with pytest.raises(EventLoggerConfigurationError, match="missing required columns"):
-        sink.validate()
+    _make_type_verifier(spark.staging_schema)(spark.staged_rows[0])
+    assert spark.staged_rows[0]["metric_value"] == 7.0
+    assert spark.staging_schema.fieldNames() == list(EVENT_COLUMNS)
+    assert spark.staging_schema["event_name"].nullable is False
+    assert spark.staging_schema["error_frames_json"].nullable is True
+    assert len(spark.sql_calls) == 1
+    assert spark.sql_calls[0].startswith("INSERT INTO catalog.schema.events")
+    assert spark.insert_result.collected is True
+    assert spark.dropped == [spark.dataframe.view_name]
 
 
-def test_delta_sink_validate_accepts_expected_columns():
-    """
-    What: Accepts a described table that contains the required v1 columns.
-    Why: validate_sink=True should be usable against a correctly deployed table.
-    Fails when: validation rejects the standard event table schema.
-    """
-    spark = _DescribeSpark(columns=list(EVENT_COLUMNS))
-    sink = DeltaSink(spark=spark, table_name="catalog.schema.event_log")
-
-    sink.validate()
-
-    assert spark.sql_calls == ["DESCRIBE TABLE catalog.schema.event_log"]
-
-
-def test_delta_sink_validate_accepts_extra_columns():
-    """
-    What: Accepts a described table that contains required columns plus extras.
-    Why: Platform teams may add future or governance columns without breaking bootstrap.
-    Fails when: validate_sink=True rejects compatible event tables with extra columns.
-    """
-    spark = _DescribeSpark(columns=[*EVENT_COLUMNS, "future_column"])
-    sink = DeltaSink(spark=spark, table_name="catalog.schema.event_log")
-
-    sink.validate()
-
-    assert spark.sql_calls == ["DESCRIBE TABLE catalog.schema.event_log"]
-
-
-def test_delta_sink_preserves_insert_error_when_cleanup_fails():
-    """
-    What: Keeps the SQL INSERT exception when temp-view cleanup also fails.
-    Why: The actionable persistence error should not be hidden by cleanup failure.
-    Fails when: DROP VIEW errors mask the original insert failure.
-    """
+@pytest.mark.parametrize("fail_collect", [False, True])
+def test_failed_insert_still_drops_view_and_preserves_error_under_warnings_as_errors(fail_collect):
     pytest.importorskip("pyspark")
-    spark = _InsertAndCleanupFailSpark()
-    sink = DeltaSink(spark=spark, table_name="catalog.schema.event_log")
-
-    with pytest.warns(RuntimeWarning, match="clean up staging view"):
+    spark = FakeSpark(fail_insert=not fail_collect, fail_collect=fail_collect, fail_cleanup=True)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
         with pytest.raises(RuntimeError, match="insert failed"):
-            sink.emit(EventRecord("reporting.delta_write"))
+            DeltaSink(spark, "catalog.schema.events").emit(EventRecord("positions.publish"))
+    assert spark.dropped == [spark.dataframe.view_name]
 
 
-def test_delta_sink_warns_when_cleanup_fails_after_successful_insert():
-    """
-    What: Treats temp-view cleanup failure as non-fatal after a successful insert.
-    Why: Successful event persistence should not fail strict production jobs on cleanup.
-    Fails when: DROP VIEW errors override a completed INSERT.
-    """
+def test_cleanup_failure_does_not_fail_acknowledged_insert():
     pytest.importorskip("pyspark")
-    spark = _CleanupFailSpark()
-    sink = DeltaSink(spark=spark, table_name="catalog.schema.event_log")
+    spark = FakeSpark(fail_cleanup=True)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        DeltaSink(spark, "catalog.schema.events").emit(EventRecord("positions.publish"))
+    assert spark.insert_result.collected
 
+
+def test_cleanup_failure_is_reported_as_warning():
+    pytest.importorskip("pyspark")
     with pytest.warns(RuntimeWarning, match="clean up staging view"):
-        sink.emit(EventRecord("reporting.delta_write"))
-
-    assert spark.sql_calls[0].startswith("INSERT INTO catalog.schema.event_log")
-    assert spark.sql_calls[1].startswith("DROP VIEW IF EXISTS")
+        sink = DeltaSink(FakeSpark(fail_cleanup=True), "catalog.schema.events")
+        sink.emit(EventRecord("example"))
 
 
-def test_event_columns_match_create_event_log_ddl():
-    """
-    What: Compares DeltaSink EVENT_COLUMNS to the SQL table template.
-    Why: DDL/schema drift breaks persisted inserts in Databricks.
-    Fails when: A column is added to one representation but not the other.
-    """
-    ddl_path = Path(__file__).parents[2] / "resources" / "sql" / "create_event_log.sql"
-    ddl_text = ddl_path.read_text(encoding="utf-8")
-    ddl_columns = [
-        match.group(1)
-        for line in ddl_text.splitlines()
-        if (match := re.match(r"\s{2}([a-z_]+)\s+", line))
+def test_broken_warning_handler_cannot_hide_insert_error(monkeypatch):
+    pytest.importorskip("pyspark")
+
+    def broken_warning(*args, **kwargs):
+        raise KeyboardInterrupt("broken warning handler")
+
+    monkeypatch.setattr(warnings, "warn", broken_warning)
+    sink = DeltaSink(
+        FakeSpark(fail_insert=True, fail_cleanup=True), "catalog.schema.events",
+    )
+    with pytest.raises(RuntimeError, match="insert failed"):
+        sink.emit(EventRecord("example"))
+
+
+def test_validate_accepts_matching_schema_with_nullable_extra_column():
+    schema = fake_schema() + [fake_field("team_note", "string", True)]
+    spark = FakeSpark(table_schema=schema)
+    DeltaSink(spark, "catalog.schema.events").validate()
+    assert spark.table_calls == ["catalog.schema.events"]
+    assert spark.sql_calls == []
+
+
+@pytest.mark.parametrize(
+    ("change", "message"),
+    [
+        ("missing", "missing required columns: row_count"),
+        ("type", "metric_value must have type DOUBLE"),
+        ("nullability", "metadata_json must allow nulls"),
+        ("extra_required", "additional column team_note must allow nulls"),
+    ],
+)
+def test_validate_rejects_schema_that_cannot_accept_event_rows(change, message):
+    schema = fake_schema()
+    if change == "missing":
+        schema = [item for item in schema if item.name != "row_count"]
+    elif change == "type":
+        schema = [
+            fake_field("metric_value", "bigint", True) if item.name == "metric_value" else item
+            for item in schema
+        ]
+    elif change == "nullability":
+        schema = [
+            fake_field("metadata_json", "string", False) if item.name == "metadata_json" else item
+            for item in schema
+        ]
+    else:
+        schema.append(fake_field("team_note", "string", False))
+    with pytest.raises(EventLoggerConfigurationError, match=message):
+        DeltaSink(FakeSpark(table_schema=schema), "catalog.schema.events").validate()
+
+
+def test_validate_wraps_table_access_failure():
+    class MissingTable:
+        def table(self, name):
+            raise RuntimeError("not found")
+
+    with pytest.raises(EventLoggerConfigurationError, match="could not read the schema") as error:
+        DeltaSink(MissingTable(), "catalog.schema.events").validate()
+    assert isinstance(error.value.__cause__, RuntimeError)
+
+
+def test_validate_accepts_real_pyspark_schema_without_starting_spark():
+    pytest.importorskip("pyspark")
+    DeltaSink(FakeSpark(table_schema=_event_schema()), "catalog.schema.events").validate()
+
+
+def fake_field(name, data_type, nullable):
+    return SimpleNamespace(
+        name=name, nullable=nullable, dataType=SimpleNamespace(simpleString=lambda: data_type),
+    )
+
+
+def fake_schema():
+    return [
+        fake_field(name, sql_type.lower(), nullable) for name, sql_type, nullable in EVENT_SCHEMA
     ]
 
-    assert ddl_columns == list(EVENT_COLUMNS)
+
+class FakeResult:
+    def __init__(self, fail=False):
+        self.fail = fail
+        self.collected = False
+
+    def collect(self):
+        if self.fail:
+            raise RuntimeError("insert failed")
+        self.collected = True
+        return []
 
 
-class _FakeSpark:
-    """
-    Minimal Spark test double for DeltaSink SQL-write assertions.
-    """
+class FakeDataFrame:
+    def __init__(self):
+        self.view_name = None
 
-    def __init__(self) -> None:
-        self.data = None
-        self.schema = None
-        self.dataframe = _FakeDataFrame()
-        self.sql_calls: list[str] = []
-
-    def createDataFrame(self, data, schema=None):  # noqa: N802 - Spark API casing.
-        """
-        Capture the staged row and schema.
-        """
-        self.data = data
-        self.schema = schema
-        return self.dataframe
-
-    def sql(self, query: str) -> None:
-        """
-        Capture SQL statements in a whitespace-normalized form.
-        """
-        self.sql_calls.append(" ".join(query.split()))
-
-
-class _FakeDataFrame:
-    """
-    Minimal DataFrame test double for temp-view registration.
-    """
-
-    def __init__(self) -> None:
-        self.view_name = ""
-
-    def createOrReplaceTempView(self, name: str) -> None:
-        """
-        Capture the temp view name.
-        """
+    def createOrReplaceTempView(self, name):  # noqa: N802
         self.view_name = name
 
 
-class _DescribeSpark:
-    """
-    Minimal Spark test double for DeltaSink.validate.
-    """
+class FakeSpark:
+    """Implements the Spark methods exercised by delivery and schema inspection."""
 
-    def __init__(self, columns: list[str]) -> None:
-        self.columns = columns
-        self.sql_calls: list[str] = []
+    def __init__(
+        self, *, fail_insert=False, fail_collect=False, fail_cleanup=False, table_schema=None,
+    ):
+        self.fail_insert = fail_insert
+        self.fail_cleanup = fail_cleanup
+        self.insert_result = FakeResult(fail_collect)
+        self.dataframe = FakeDataFrame()
+        self.table_schema = table_schema
+        self.catalog = self
+        self.sql_calls = []
+        self.table_calls = []
+        self.dropped = []
+        self.staged_rows = None
+        self.staging_schema = None
 
-    def sql(self, query: str):
-        """
-        Return DESCRIBE TABLE rows for the configured columns.
-        """
+    def createDataFrame(self, rows, schema):  # noqa: N802
+        self.staged_rows = rows
+        self.staging_schema = schema
+        return self.dataframe
+
+    def sql(self, query):
         self.sql_calls.append(" ".join(query.split()))
-        return _DescribeResult(self.columns)
-
-
-class _DescribeResult:
-    """
-    Minimal DESCRIBE TABLE result test double.
-    """
-
-    def __init__(self, columns: list[str]) -> None:
-        self.columns = columns
-
-    def collect(self):
-        """
-        Return dictionaries shaped like Spark DESCRIBE TABLE rows.
-        """
-        return [{"col_name": column} for column in self.columns]
-
-
-class _InsertAndCleanupFailSpark(_FakeSpark):
-    """
-    Spark test double that raises for both insert and cleanup SQL.
-    """
-
-    def sql(self, query: str) -> None:
-        """
-        Raise distinct errors for insert and cleanup.
-        """
-        normalized = " ".join(query.split())
-        self.sql_calls.append(normalized)
-        if normalized.startswith("INSERT INTO"):
+        if self.fail_insert:
             raise RuntimeError("insert failed")
-        if normalized.startswith("DROP VIEW"):
-            raise RuntimeError("drop failed")
+        return self.insert_result
 
+    def dropTempView(self, name):  # noqa: N802
+        self.dropped.append(name)
+        if self.fail_cleanup:
+            raise RuntimeError("cleanup failed")
+        return True
 
-class _CleanupFailSpark(_FakeSpark):
-    """
-    Spark test double that inserts successfully but fails temp-view cleanup.
-    """
-
-    def sql(self, query: str) -> None:
-        """
-        Raise only for cleanup SQL.
-        """
-        normalized = " ".join(query.split())
-        self.sql_calls.append(normalized)
-        if normalized.startswith("DROP VIEW"):
-            raise RuntimeError("drop failed")
+    def table(self, name):
+        self.table_calls.append(name)
+        return SimpleNamespace(schema=self.table_schema)

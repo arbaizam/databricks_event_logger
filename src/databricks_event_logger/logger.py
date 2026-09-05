@@ -1,33 +1,31 @@
-"""
-Event logger public API.
-
-``EventLogger`` owns event construction, failure capture, and sink dispatch.
-Business code should not need repetitive ``try``/``except`` blocks. Decorators,
-context managers, and task wrappers centralize that behavior while preserving
-the original exception for Databricks job failure semantics.
-"""
+"""Record events and observe operations through one lifecycle."""
 
 from __future__ import annotations
 
 import hashlib
-import traceback
+import inspect
+import json
 import warnings
-from collections.abc import Callable, Mapping
+from collections import deque
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from contextvars import ContextVar
+from copy import copy
+from dataclasses import dataclass, field, replace
 from datetime import datetime
-from functools import wraps
-from typing import Any, TypeVar
+from pathlib import PurePath
+from threading import Lock
+from typing import Any, TypeVar, cast
 from uuid import uuid4
 
-from databricks_event_logger.config import EventLoggerConfig
-from databricks_event_logger.context import RuntimeContext, resolve_databricks_context
+from databricks_event_logger.context import RuntimeContext
 from databricks_event_logger.errors import EventLoggerConfigurationError
 from databricks_event_logger.event import EventRecord
 from databricks_event_logger.serialization import (
     DEFAULT_METADATA_MAX_BYTES,
     DEFAULT_METADATA_STRING_MAX_CHARS,
     DEFAULT_REDACT_KEYS,
+    safe_text,
     serialize_metadata,
 )
 from databricks_event_logger.sinks.base import EventSink
@@ -36,58 +34,50 @@ from databricks_event_logger.timing import elapsed_ms, monotonic_ms, utc_now
 
 F = TypeVar("F", bound=Callable[..., Any])
 T = TypeVar("T")
-MetadataFactory = Callable[..., Mapping[str, Any] | None]
+_default_logger: ContextVar[EventLogger | None] = ContextVar("event_logger_default", default=None)
 
-_default_logger: ContextVar[EventLogger | None] = ContextVar(
-    "databricks_event_logger_default",
-    default=None,
-)
-_current_event_id: ContextVar[str | None] = ContextVar(
-    "databricks_event_logger_current_event_id",
-    default=None,
-)
+
+@dataclass(frozen=True)
+class DeliveryHealth:
+    """A snapshot of delivery attempts, including event-preparation failures."""
+
+    attempted: int = 0
+    succeeded: int = 0
+    failed: int = 0
+    last_error: str | None = None
+
+
+@dataclass
+class _DeliveryState:
+    health: DeliveryHealth = field(default_factory=DeliveryHealth)
+    lock: Any = field(default_factory=Lock)
+
+
+@dataclass
+class EventScope:
+    """Editable result fields for one running operation; emitted when the block exits."""
+
+    _event: EventRecord = field(repr=False)
+    metadata: dict[str, Any] = field(default_factory=dict)
+    row_count: int | None = None
+    status: str = "success"
+    severity: str | None = None
+    source_table: str | None = None
+    target_table: str | None = None
+
+    @property
+    def event_id(self) -> str:
+        """The operation ID, available before its final event is emitted."""
+        return self._event.event_id
 
 
 class EventLogger:
-    """
-    Lightweight structured event logger.
+    """Structured events with explicit identity, metadata, and a synchronous sink.
 
-    Parameters
-    ----------
-    app_name : str | None, default None
-        Application name stamped onto emitted events.
-    component : str | None, default None
-        Component name stamped onto emitted events.
-    environment : str | None, default None
-        Environment or bundle target stamped onto emitted events.
-    sink : EventSink | None, default None
-        Event sink. When omitted, events are written as JSON lines through
-        ``ConsoleSink``.
-    context : RuntimeContext | None, default None
-        Runtime context to attach to events.
-    correlation_id : str | None, default None
-        Correlation identifier shared by emitted events. When omitted, the
-        logger derives a stable value from Databricks task/run context when
-        available and falls back to a UUID outside Databricks.
-    default_metadata : dict[str, Any] | None, default None
-        Metadata merged into every event emitted by this logger. Event-level
-        metadata wins when the same key appears in both places.
-    metadata_max_bytes : int | None, default 4000
-        Maximum serialized ``metadata_json`` size. ``None`` disables the cap.
-    metadata_string_max_chars : int | None, default 2000
-        Maximum string value length inside metadata. ``None`` disables string
-        truncation.
-    error_message_max_chars : int | None, default 2000
-        Maximum stored exception message length. ``None`` disables truncation.
-    redact_keys : tuple[str, ...], default DEFAULT_REDACT_KEYS
-        Case-insensitive metadata key fragments whose values are redacted.
-    strict_logging : bool, default False
-        When True, sink failures from successful business paths are raised
-        instead of warned. Failure-event logging still preserves the original
-        business exception.
-    max_events_warning_threshold : int | None, default 100
-        Warn once when a logger emits more than this many events. ``None``
-        disables the guardrail.
+    Ordinary preparation/delivery failures warn and return ``None``. Strict mode
+    raises them after successful work; an active business exception always wins.
+    Bound loggers share delivery health and operation lineage. Independent
+    loggers have independent lineage, even when using the same sink.
     """
 
     def __init__(
@@ -99,62 +89,60 @@ class EventLogger:
         sink: EventSink | None = None,
         context: RuntimeContext | None = None,
         correlation_id: str | None = None,
-        default_metadata: dict[str, Any] | None = None,
+        default_metadata: Mapping[str, Any] | None = None,
         metadata_max_bytes: int | None = DEFAULT_METADATA_MAX_BYTES,
         metadata_string_max_chars: int | None = DEFAULT_METADATA_STRING_MAX_CHARS,
         error_message_max_chars: int | None = 2000,
         redact_keys: tuple[str, ...] = DEFAULT_REDACT_KEYS,
         strict_logging: bool = False,
-        max_events_warning_threshold: int | None = 100,
+        capture_error_frames: bool = False,
     ) -> None:
-        """
-        Create an event logger.
-        """
-        self.config = EventLoggerConfig(
-            app_name=app_name,
-            component=component,
-            environment=environment,
+        # Configuration errors are detected before any business operation starts.
+        serialize_metadata(
+            {},
+            redact_keys=redact_keys,
+            string_max_chars=metadata_string_max_chars,
+            max_bytes=metadata_max_bytes,
         )
-        self.context = context or RuntimeContext()
-        self.correlation_id = (
-            correlation_id or _correlation_id_from_context(self.context) or str(uuid4())
-        )
-        self.sink: EventSink = sink if sink is not None else ConsoleSink()
-        self.default_metadata = dict(default_metadata or {})
+        if error_message_max_chars is not None and (
+            type(error_message_max_chars) is not int or error_message_max_chars < 0
+        ):
+            raise ValueError("error_message_max_chars must be a nonnegative integer or None.")
+        self.app_name = app_name
+        self.component = component
+        self.environment = environment
+        self.context = context if context is not None else RuntimeContext()
+        self.correlation_id = correlation_id if correlation_id is not None else str(uuid4())
+        self.sink = sink if sink is not None else ConsoleSink()
+        if not callable(getattr(self.sink, "emit", None)):
+            raise TypeError("sink must provide emit(event).")
+        self._default_metadata = _copy_metadata(default_metadata)
         self.metadata_max_bytes = metadata_max_bytes
         self.metadata_string_max_chars = metadata_string_max_chars
         self.error_message_max_chars = error_message_max_chars
-        self.redact_keys = redact_keys
+        self.redact_keys = tuple(redact_keys)
         self.strict_logging = strict_logging
-        self.max_events_warning_threshold = max_events_warning_threshold
-        self._event_count = 0
-        self._event_threshold_warned = False
+        self.capture_error_frames = capture_error_frames
+        self._delivery = _DeliveryState()
+        self._current_event_id: ContextVar[str | None] = ContextVar("event_parent", default=None)
+        self._new_record("logger.configuration")
 
     @property
-    def job_url(self) -> str | None:
-        """
-        Return the Databricks job UI URL when workspace and job ids are known.
-
-        Returns
-        -------
-        str | None
-            URL shaped as ``https://<workspace>/jobs/<job_id>``, or ``None``
-            when the current context is not a Databricks job run.
-        """
-        return _job_url(self.context)
+    def health(self) -> DeliveryHealth:
+        """Return a consistent, immutable snapshot shared by this logger's bindings."""
+        with self._delivery.lock:
+            return self._delivery.health
 
     @property
-    def job_run_url(self) -> str | None:
-        """
-        Return the Databricks job-run UI URL when run identifiers are known.
+    def default_metadata(self) -> dict[str, Any]:
+        """Return a shallow copy; nested values remain owned by the caller."""
+        return dict(self._default_metadata)
 
-        Returns
-        -------
-        str | None
-            URL shaped as ``https://<workspace>/jobs/<job_id>/runs/<run_id>``,
-            or ``None`` when any required field is unavailable.
-        """
-        return _job_run_url(self.context)
+    def bind(self, **metadata: Any) -> EventLogger:
+        """Bind a shallow metadata snapshot while sharing delivery and lineage."""
+        child = copy(self)
+        child._default_metadata = {**self._default_metadata, **metadata}
+        return child
 
     def record_event(
         self,
@@ -163,145 +151,115 @@ class EventLogger:
         event_type: str = "custom",
         status: str = "success",
         severity: str | None = None,
-        metadata: dict[str, Any] | None = None,
+        metadata: Mapping[str, Any] | None = None,
         event_id: str | None = None,
+        parent_event_id: str | None = None,
         source_table: str | None = None,
         target_table: str | None = None,
         row_count: int | None = None,
         metric_name: str | None = None,
-        metric_value: float | None = None,
+        metric_value: float | int | None = None,
         start_ts: datetime | None = None,
         end_ts: datetime | None = None,
         duration_ms: int | None = None,
-        error_class: str | None = None,
-        error_message: str | None = None,
-        stack_trace_hash: str | None = None,
-        parent_event_id: str | None = None,
-        use_current_parent: bool = True,
-    ) -> EventRecord:
-        """
-        Create and emit one event.
-
-        Parameters
-        ----------
-        event_name : str
-            Stable event name.
-        event_type : str, default "custom"
-            Event category.
-        status : str, default "success"
-            Event status.
-        severity : str | None, default None
-            Optional severity label.
-        metadata : dict[str, Any] | None, default None
-            Caller-controlled metadata.
-        event_id : str | None, default None
-            Optional preallocated event id. Decorators and context managers use
-            this so nested events can point at the operation being observed.
-        source_table : str | None, default None
-            Source table for I/O events.
-        target_table : str | None, default None
-            Target table for I/O events.
-        row_count : int | None, default None
-            Known row count. The logger never computes this automatically.
-        metric_name : str | None, default None
-            Metric name for metric events.
-        metric_value : float | None, default None
-            Metric value for metric events.
-        start_ts, end_ts : datetime | None, default None
-            Optional operation timestamps.
-        duration_ms : int | None, default None
-            Optional measured operation duration.
-        error_class : str | None, default None
-            Exception class name for failed events.
-        error_message : str | None, default None
-            Exception message for failed events.
-        stack_trace_hash : str | None, default None
-            Stable hash of the captured stack trace.
-        parent_event_id : str | None, default None
-            Parent event id. Defaults to the current active event, if any.
-        use_current_parent : bool, default True
-            When True, attach the current active event as parent if
-            ``parent_event_id`` is omitted. Observed wrapper events set this to
-            False so they do not parent to themselves.
-
-        Returns
-        -------
-        EventRecord
-            Event object that was handed to the sink.
-        """
-        metadata_json = serialize_metadata(
-            self._merge_metadata(metadata),
-            redact_keys=self.redact_keys,
-            string_max_chars=self.metadata_string_max_chars,
-            max_bytes=self.metadata_max_bytes,
-        )
-        event = EventRecord(
-            event_name=event_name,
+    ) -> EventRecord | None:
+        """Validate and deliver one event; return None if non-strict delivery fails."""
+        _validate_metadata(metadata)
+        event = self._new_record(
+            event_name,
             event_type=event_type,
             status=status,
-            event_id=event_id,
-            correlation_id=self.correlation_id,
-            parent_event_id=(
-                parent_event_id
-                if parent_event_id is not None
-                else (_current_event_id.get() if use_current_parent else None)
-            ),
-            start_ts=start_ts,
-            end_ts=end_ts,
-            duration_ms=duration_ms,
             severity=severity,
-            app_name=self.config.app_name,
-            component=self.config.component,
-            environment=self.config.environment,
-            context=self.context,
+            event_id=event_id if event_id is not None else str(uuid4()),
+            parent_event_id=(
+                parent_event_id if parent_event_id is not None else self._current_event_id.get()
+            ),
             source_table=source_table,
             target_table=target_table,
             row_count=row_count,
             metric_name=metric_name,
             metric_value=metric_value,
-            error_class=error_class,
-            error_message=self._bounded_text(error_message, self.error_message_max_chars),
-            stack_trace_hash=stack_trace_hash,
-            metadata_json=metadata_json,
+            start_ts=start_ts,
+            end_ts=end_ts,
+            duration_ms=duration_ms,
         )
-        self._emit(event)
-        return event
+        return self._deliver(event, metadata)
 
     def record_metric(
         self,
         metric_name: str,
-        metric_value: float,
+        metric_value: int | float,
         *,
         event_name: str | None = None,
-        metadata: dict[str, Any] | None = None,
-    ) -> EventRecord:
-        """
-        Record one explicit metric event.
-
-        Parameters
-        ----------
-        metric_name : str
-            Metric identifier.
-        metric_value : float
-            Numeric metric value.
-        event_name : str | None, default None
-            Optional event name. Defaults to ``metric.<metric_name>``.
-        metadata : dict[str, Any] | None, default None
-            Caller-controlled metadata.
-
-        Returns
-        -------
-        EventRecord
-            Emitted metric event.
-        """
+        metadata: Mapping[str, Any] | None = None,
+    ) -> EventRecord | None:
+        """Record an explicit numeric metric; no computation is performed."""
         return self.record_event(
-            event_name or f"metric.{metric_name}",
+            event_name if event_name is not None else f"metric.{metric_name}",
             event_type="metric",
-            status="success",
             metric_name=metric_name,
             metric_value=metric_value,
             metadata=metadata,
         )
+
+    def event(
+        self,
+        event_name: str,
+        *,
+        event_type: str = "custom",
+        metadata: Mapping[str, Any] | None = None,
+        status: str = "success",
+        severity: str | None = None,
+        source_table: str | None = None,
+        target_table: str | None = None,
+        row_count: int | None = None,
+    ):
+        """Observe a block and yield editable results. Also usable inside async functions."""
+        event = self._new_record(
+            event_name,
+            event_type=event_type,
+            status=status,
+            severity=severity,
+            source_table=source_table,
+            target_table=target_table,
+            row_count=row_count,
+        )
+        scope = EventScope(
+            event, _copy_metadata(metadata), row_count, status, severity, source_table, target_table
+        )
+        return self._event_scope(scope)
+
+    @contextmanager
+    def _event_scope(self, scope: EventScope) -> Iterator[EventScope]:
+        event = replace(
+            scope._event, parent_event_id=self._current_event_id.get(), start_ts=utc_now()
+        )
+        started = monotonic_ms()
+        token = self._current_event_id.set(event.event_id)
+        error: BaseException | None = None
+        try:
+            yield scope
+        except BaseException as exc:
+            error = exc
+            raise
+        finally:
+            self._current_event_id.reset(token)
+            ended = utc_now()
+            self._deliver(
+                event,
+                scope.metadata,
+                error=error,
+                changes={
+                    "row_count": scope.row_count,
+                    "status": scope.status,
+                    "severity": scope.severity,
+                    "source_table": scope.source_table,
+                    "target_table": scope.target_table,
+                    "end_ts": ended,
+                    "event_ts": ended,
+                    "duration_ms": elapsed_ms(started),
+                },
+            )
 
     def logged_event(
         self,
@@ -309,517 +267,194 @@ class EventLogger:
         *,
         event_type: str = "function",
         metadata: Mapping[str, Any] | None = None,
-        metadata_factory: MetadataFactory | None = None,
     ) -> Callable[[F], F]:
-        """
-        Decorate a function so success and failure are logged automatically.
-
-        Parameters
-        ----------
-        event_name : str
-            Event emitted when the function finishes.
-        event_type : str, default "function"
-            Event category.
-        metadata : Mapping[str, Any] | None, default None
-            Static metadata to attach to the event.
-        metadata_factory : Callable[..., Mapping[str, Any] | None] | None, default None
-            Optional callable evaluated at function-call time with the wrapped
-            function's positional and keyword arguments. Returned keys are
-            merged into ``metadata`` and win on key conflicts.
-
-        Returns
-        -------
-        Callable[[F], F]
-            Decorator that preserves the wrapped function's return value and
-            original exception behavior.
-        """
-
-        def decorator(func: F) -> F:
-            @wraps(func)
-            def wrapper(*args: Any, **kwargs: Any) -> Any:
-                return self._run_observed(
-                    event_name,
-                    lambda: func(*args, **kwargs),
-                    event_type=event_type,
-                    metadata=metadata,
-                    metadata_factory=metadata_factory,
-                    factory_args=args,
-                    factory_kwargs=kwargs,
-                )
-
-            return wrapper  # type: ignore[return-value]
-
-        return decorator
-
-    @contextmanager
-    def event(
-        self,
-        event_name: str,
-        *,
-        event_type: str = "custom",
-        metadata: dict[str, Any] | None = None,
-        source_table: str | None = None,
-        target_table: str | None = None,
-        row_count: int | None = None,
-    ):
-        """
-        Log success or failure for a custom block of code.
-
-        Parameters
-        ----------
-        event_name : str
-            Event emitted when the block exits.
-        event_type : str, default "custom"
-            Event category.
-        metadata : dict[str, Any] | None, default None
-            Caller-controlled metadata.
-        source_table : str | None, default None
-            Source table for I/O events.
-        target_table : str | None, default None
-            Target table for I/O events.
-        row_count : int | None, default None
-            Known row count for the block.
-        """
-        start_ts = utc_now()
-        start_ms = monotonic_ms()
-        event_id = str(uuid4())
-        parent_event_id = _current_event_id.get()
-        token = _current_event_id.set(event_id)
-        try:
-            yield
-        except Exception as exc:
-            end_ts = utc_now()
-            self._record_failure(
-                event_name,
-                exc,
-                event_type=event_type,
-                metadata=metadata,
-                start_ts=start_ts,
-                end_ts=end_ts,
-                duration_ms=elapsed_ms(start_ms),
-                event_id=event_id,
-                parent_event_id=parent_event_id,
-                source_table=source_table,
-                target_table=target_table,
-                row_count=row_count,
-            )
-            raise
-        else:
-            end_ts = utc_now()
-            self.record_event(
-                event_name,
-                event_type=event_type,
-                status="success",
-                metadata=metadata,
-                start_ts=start_ts,
-                end_ts=end_ts,
-                duration_ms=elapsed_ms(start_ms),
-                event_id=event_id,
-                parent_event_id=parent_event_id,
-                use_current_parent=False,
-                source_table=source_table,
-                target_table=target_table,
-                row_count=row_count,
-            )
-        finally:
-            _current_event_id.reset(token)
+        """Observe a sync/async function; generators must be scoped by their consumer."""
+        self._new_record(event_name, event_type=event_type)
+        snapshot = _copy_metadata(metadata)
+        return lambda func: _decorate(
+            func,
+            lambda: self.event(event_name, event_type=event_type, metadata=snapshot),
+        )
 
     def run_task(
         self,
         event_name: str,
         func: Callable[..., T],
         *args: Any,
-        metadata: dict[str, Any] | None = None,
+        metadata: Mapping[str, Any] | None = None,
         **kwargs: Any,
     ) -> T:
-        """
-        Run a task entry point with SDK-level lifecycle logging.
-
-        Parameters
-        ----------
-        event_name : str
-            Event emitted when the task callable finishes.
-        func : Callable[..., T]
-            Task entry-point callable.
-        *args : Any
-            Positional arguments passed to ``func``.
-        metadata : dict[str, Any] | None, default None
-            Caller-controlled metadata.
-        **kwargs : Any
-            Keyword arguments passed to ``func``.
-
-        Returns
-        -------
-        T
-            Return value from ``func``.
-        """
-        return self._run_observed(
-            event_name,
-            lambda: func(*args, **kwargs),
-            event_type="task",
-            metadata=metadata,
+        """Observe a task entry point, preserving its return value (await async tasks)."""
+        return self.logged_event(event_name, event_type="task", metadata=metadata)(func)(
+            *args,
+            **kwargs,
         )
 
-    def _run_observed(
-        self,
-        event_name: str,
-        func: Callable[[], T],
-        *,
-        event_type: str,
-        metadata: Mapping[str, Any] | None,
-        metadata_factory: MetadataFactory | None = None,
-        factory_args: tuple[Any, ...] = (),
-        factory_kwargs: Mapping[str, Any] | None = None,
-    ) -> T:
-        """
-        Execute one callable and emit success or failure.
-        """
-        start_ts = utc_now()
-        start_ms = monotonic_ms()
-        event_id = str(uuid4())
-        parent_event_id = _current_event_id.get()
-        token = _current_event_id.set(event_id)
-        resolved_metadata = _resolve_observed_metadata(
-            metadata,
-            metadata_factory,
+    def _new_record(self, event_name: str, **fields: Any) -> EventRecord:
+        return EventRecord(
             event_name=event_name,
-            factory_args=factory_args,
-            factory_kwargs=factory_kwargs,
+            app_name=self.app_name,
+            component=self.component,
+            environment=self.environment,
+            context=self.context,
+            correlation_id=self.correlation_id,
+            **fields,
         )
-        try:
-            result = func()
-        except Exception as exc:
-            end_ts = utc_now()
-            self._record_failure(
-                event_name,
-                exc,
-                event_type=event_type,
-                metadata=resolved_metadata,
-                start_ts=start_ts,
-                end_ts=end_ts,
-                duration_ms=elapsed_ms(start_ms),
-                event_id=event_id,
-                parent_event_id=parent_event_id,
-            )
-            raise
-        else:
-            end_ts = utc_now()
-            self.record_event(
-                event_name,
-                event_type=event_type,
-                status="success",
-                metadata=resolved_metadata,
-                start_ts=start_ts,
-                end_ts=end_ts,
-                duration_ms=elapsed_ms(start_ms),
-                event_id=event_id,
-                parent_event_id=parent_event_id,
-                use_current_parent=False,
-            )
-            return result
-        finally:
-            _current_event_id.reset(token)
 
-    def _record_failure(
+    def _deliver(
         self,
-        event_name: str,
-        exc: BaseException,
+        event: EventRecord,
+        metadata: Mapping[str, Any] | None,
         *,
-        event_type: str,
-        metadata: dict[str, Any] | None,
-        start_ts: datetime,
-        end_ts: datetime,
-        duration_ms: int,
-        event_id: str,
-        parent_event_id: str | None,
-        source_table: str | None = None,
-        target_table: str | None = None,
-        row_count: int | None = None,
-    ) -> None:
-        """
-        Emit a failure event without masking the original exception.
-        """
+        changes: dict[str, Any] | None = None,
+        error: BaseException | None = None,
+    ) -> EventRecord | None:
+        self._update_health("attempted")
         try:
-            self.record_event(
-                event_name,
-                event_type=event_type,
-                status="failed",
-                severity="error",
-                metadata=metadata,
-                start_ts=start_ts,
-                end_ts=end_ts,
-                duration_ms=duration_ms,
-                error_class=exc.__class__.__name__,
-                error_message=str(exc),
-                stack_trace_hash=_stack_trace_hash(exc),
-                event_id=event_id,
-                parent_event_id=parent_event_id,
-                use_current_parent=False,
-                source_table=source_table,
-                target_table=target_table,
-                row_count=row_count,
+            fields = dict(changes or {})
+            if error is not None:
+                fields.update(
+                    _error_fields(error, self.capture_error_frames, self.error_message_max_chars)
+                )
+            event = replace(
+                event,
+                **fields,
+                metadata_json=serialize_metadata(
+                    {**self._default_metadata, **(metadata if metadata is not None else {})},
+                    redact_keys=self.redact_keys,
+                    string_max_chars=self.metadata_string_max_chars,
+                    max_bytes=self.metadata_max_bytes,
+                ),
             )
-        except Exception as logging_exc:
-            # The caller is already handling a business exception. Never replace
-            # it with a secondary logging failure.
-            warnings.warn(
-                f"Failed to emit failure event {event_name!r}: {logging_exc}",
-                RuntimeWarning,
-                stacklevel=1,
-            )
-
-    def _emit(self, event: EventRecord) -> None:
-        """
-        Hand an event to the configured sink.
-        """
-        self._event_count += 1
-        self._warn_on_event_volume()
-        try:
             self.sink.emit(event)
-        except Exception as exc:
-            if self.strict_logging:
+        except BaseException as exc:
+            self._update_health("failed", f"{type(exc).__name__}: {safe_text(exc, max_chars=500)}")
+            if error is None and (self.strict_logging or not isinstance(exc, Exception)):
                 raise
-            warnings.warn(
-                f"Failed to emit event {event.event_name!r}: {exc}",
-                RuntimeWarning,
-                stacklevel=3,
+            _warn_delivery(type(exc).__name__)
+            return None
+        self._update_health("succeeded")
+        return event
+
+    def _update_health(self, counter: str, last_error: str | None = None) -> None:
+        with self._delivery.lock:
+            health = self._delivery.health
+            self._delivery.health = replace(
+                health,
+                **{counter: getattr(health, counter) + 1},
+                last_error=last_error if last_error is not None else health.last_error,
             )
 
-    def _merge_metadata(self, metadata: dict[str, Any] | None) -> dict[str, Any] | None:
-        """
-        Merge logger defaults with event-level metadata.
-        """
-        if not self.default_metadata and not metadata:
-            return None
-        merged = dict(self.default_metadata)
-        if metadata:
-            merged.update(metadata)
-        return merged
 
-    def _bounded_text(self, value: str | None, max_chars: int | None) -> str | None:
-        """
-        Return a bounded text value for high-volume error fields.
-        """
-        if value is None or max_chars is None or max_chars < 0 or len(value) <= max_chars:
-            return value
-        return f"{value[:max_chars]}...[TRUNCATED]"
+def _validate_metadata(metadata: Mapping[str, Any] | None) -> None:
+    if metadata is not None and not isinstance(metadata, Mapping):
+        raise TypeError("metadata must be a mapping or None.")
 
-    def _warn_on_event_volume(self) -> None:
-        """
-        Warn once when a logger emits more events than expected for one task.
-        """
-        threshold = self.max_events_warning_threshold
-        if threshold is None or self._event_threshold_warned or self._event_count <= threshold:
-            return
-        self._event_threshold_warned = True
+
+def _copy_metadata(metadata: Mapping[str, Any] | None) -> dict[str, Any]:
+    _validate_metadata(metadata)
+    return dict(metadata) if metadata is not None else {}
+
+
+def _error_fields(
+    exc: BaseException, capture_frames: bool, max_chars: int | None
+) -> dict[str, Any]:
+    # Only file basenames, function names and line numbers: never source or locals.
+    frames: deque[dict[str, Any]] = deque(maxlen=20)
+    trace = exc.__traceback__
+    while trace is not None:
+        code = trace.tb_frame.f_code
+        frames.append(
+            {
+                "file": PurePath(code.co_filename).name[:200],
+                "function": code.co_name[:200],
+                "line": trace.tb_lineno,
+            }
+        )
+        trace = trace.tb_next
+    encoded = json.dumps(list(frames), separators=(",", ":"))
+    fingerprint = hashlib.sha256(f"{type(exc).__name__}:{encoded}".encode()).hexdigest()
+    return {
+        "status": "failed",
+        "severity": "error",
+        "error_class": type(exc).__name__,
+        "error_message": safe_text(exc, max_chars=max_chars),
+        "stack_trace_hash": fingerprint,
+        "error_frames_json": encoded if capture_frames else None,
+    }
+
+
+def _warn_delivery(error_class: str) -> None:
+    try:
         warnings.warn(
-            "EventLogger has emitted more than "
-            f"{threshold} events in this logger instance. Consider aggregating "
-            "very chatty loops into summary events when possible.",
+            f"Event delivery failed ({error_class}); inspect logger.health.",
             RuntimeWarning,
             stacklevel=3,
         )
+    except BaseException:
+        # Warning filters and custom warning handlers must not alter business control flow.
+        pass
 
-def set_default_logger(logger: EventLogger) -> None:
-    """
-    Set the default logger for decorators and helper functions.
 
-    Parameters
-    ----------
-    logger : EventLogger
-        Logger to use as the current default.
-    """
-    _default_logger.set(logger)
+def _decorate(func: F, scope_factory: Callable[..., Any]) -> F:
+    from functools import wraps
+
+    if inspect.isgeneratorfunction(func) or inspect.isasyncgenfunction(func):
+        raise TypeError(
+            "Generator functions are not supported; observe their iteration with event()."
+        )
+    if inspect.iscoroutinefunction(func):
+
+        @wraps(func)
+        async def async_wrapper(*args: Any, **kwargs: Any) -> Any:
+            with scope_factory():
+                return await func(*args, **kwargs)
+
+        return cast(F, async_wrapper)
+
+    @wraps(func)
+    def wrapper(*args: Any, **kwargs: Any) -> Any:
+        with scope_factory():
+            return func(*args, **kwargs)
+
+    return cast(F, wrapper)
+
+
+@contextmanager
+def use_logger(logger: EventLogger) -> Iterator[EventLogger]:
+    """Install a context-local default logger and restore its predecessor on exit."""
+    if not isinstance(logger, EventLogger):
+        raise TypeError("logger must be an EventLogger.")
+    token = _default_logger.set(logger)
+    try:
+        yield logger
+    finally:
+        _default_logger.reset(token)
 
 
 def get_default_logger() -> EventLogger:
-    """
-    Return the configured default logger.
-
-    Returns
-    -------
-    EventLogger
-        Current default logger.
-
-    Raises
-    ------
-    EventLoggerConfigurationError
-        If ``observe_notebook`` or ``set_default_logger`` has not configured a
-        default logger.
-    """
     logger = _default_logger.get()
     if logger is None:
         raise EventLoggerConfigurationError(
-            "No default EventLogger is configured. Call observe_notebook(...) "
-            "or set_default_logger(...) before using default logger helpers."
+            "No default logger; configure one with use_logger(logger)."
         )
     return logger
 
 
-def observe_notebook(
-    *,
-    spark: Any,
-    dbutils: Any,
-    app_name: str | None = None,
-    component: str | None = None,
-    environment: str | None = None,
-    sink: EventSink | None = None,
-    correlation_id: str | None = None,
-    default_metadata: dict[str, Any] | None = None,
-    strict_logging: bool = False,
-) -> EventLogger:
-    """
-    Initialize the default Databricks notebook logger and emit ``notebook.started``.
-
-    ``spark`` and ``dbutils`` are explicit required dependencies. The default
-    sink is ``ConsoleSink``; pass ``DeltaSink(spark, table_name)`` when events
-    must be persisted.
-    """
-    logger = EventLogger(
-        app_name=app_name,
-        component=component,
-        environment=environment,
-        sink=sink,
-        context=resolve_databricks_context(dbutils=dbutils, spark=spark),
-        correlation_id=correlation_id,
-        default_metadata=default_metadata,
-        strict_logging=strict_logging,
-    )
-    set_default_logger(logger)
-    logger.record_event(
-        "notebook.started",
-        event_type="notebook",
-        status="started",
-        metadata={
-            "sink_type": type(logger.sink).__name__,
-            "event_table": getattr(logger.sink, "table_name", None),
-            "strict_logging": strict_logging,
-            "job_url": logger.job_url,
-            "job_run_url": logger.job_run_url,
-        },
-    )
-    return logger
-
-
-def _stack_trace_hash(exc: BaseException) -> str:
-    """
-    Return a hash identifying one exception instance.
-
-    The hash includes the traceback, so it varies between call sites and across
-    code changes.
-    """
-    trace_text = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
-    return hashlib.sha256(trace_text.encode("utf-8")).hexdigest()
-
-
-def _resolve_observed_metadata(
-    metadata: Mapping[str, Any] | None,
-    metadata_factory: MetadataFactory | None,
-    *,
+def observed(
     event_name: str,
-    factory_args: tuple[Any, ...],
-    factory_kwargs: Mapping[str, Any] | None,
-) -> dict[str, Any] | None:
-    """
-    Resolve static and call-time metadata for observed functions.
-    """
-    resolved = _copy_metadata(metadata)
-    if metadata_factory is None:
-        return resolved
-    try:
-        factory_metadata = metadata_factory(*factory_args, **dict(factory_kwargs or {}))
-        factory_metadata = dict(factory_metadata or {})
-    except Exception as exc:
-        resolved = _metadata_with_factory_error(resolved, exc)
-        warnings.warn(
-            f"metadata_factory for {event_name!r} raised "
-            f"{type(exc).__name__}: {exc}. Static metadata will be used.",
-            RuntimeWarning,
-            stacklevel=3,
-        )
-        return resolved
-    if factory_metadata:
-        if resolved is None:
-            resolved = {}
-        resolved.update(factory_metadata)
-    return resolved
-
-
-def _copy_metadata(metadata: Mapping[str, Any] | None) -> dict[str, Any] | None:
-    """
-    Return a mutable metadata copy while preserving empty metadata as ``None``.
-    """
-    if not metadata:
-        return None
-    return dict(metadata)
-
-
-def _metadata_with_factory_error(
-    metadata: dict[str, Any] | None,
-    exc: BaseException,
-) -> dict[str, Any]:
-    """
-    Return metadata annotated with a non-blocking metadata factory failure.
-    """
-    resolved = dict(metadata or {})
-    resolved.update(
-        {
-            "metadata_factory_error": True,
-            "metadata_factory_error_class": type(exc).__name__,
-            "metadata_factory_error_message": str(exc),
-        }
+    *,
+    event_type: str = "function",
+    metadata: Mapping[str, Any] | None = None,
+) -> Callable[[F], F]:
+    """Observe a function using the default logger active when it is called."""
+    EventRecord(event_name=event_name, event_type=event_type)
+    snapshot = _copy_metadata(metadata)
+    return lambda func: _decorate(
+        func,
+        lambda: get_default_logger().event(
+            event_name,
+            event_type=event_type,
+            metadata=snapshot,
+        ),
     )
-    return resolved
-
-
-def _correlation_id_from_context(context: RuntimeContext) -> str | None:
-    """
-    Return a stable task/run correlation id from Databricks context.
-
-    The default is task-run correlation: ``task_run_id`` when Databricks
-    supplies it, otherwise ``run_id:task_key[:attempt]`` or ``run_id``. Pass an
-    explicit ``correlation_id`` when a workflow needs a single ID shared across
-    multiple tasks or retries.
-    """
-    if context.task_run_id:
-        return context.task_run_id
-    if context.run_id and context.task_key:
-        parts = [context.run_id, context.task_key]
-        if context.task_attempt_number:
-            parts.append(context.task_attempt_number)
-        return ":".join(parts)
-    if context.run_id:
-        return context.run_id
-    return None
-
-
-def _job_url(context: RuntimeContext) -> str | None:
-    """
-    Build the Databricks job URL from normalized runtime context.
-    """
-    workspace_url = _workspace_url_with_scheme(context.workspace_url)
-    if not workspace_url or not context.job_id:
-        return None
-    return f"{workspace_url}/jobs/{context.job_id}"
-
-
-def _job_run_url(context: RuntimeContext) -> str | None:
-    """
-    Build the Databricks job-run URL from normalized runtime context.
-    """
-    job_url = _job_url(context)
-    if not job_url or not context.run_id:
-        return None
-    return f"{job_url}/runs/{context.run_id}"
-
-
-def _workspace_url_with_scheme(workspace_url: str | None) -> str | None:
-    """
-    Return a browser-ready workspace URL.
-    """
-    if not workspace_url:
-        return None
-    normalized = workspace_url.strip().rstrip("/").lower()
-    if normalized.startswith("http://") or normalized.startswith("https://"):
-        return normalized
-    return f"https://{normalized}"

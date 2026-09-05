@@ -1,729 +1,494 @@
+import asyncio
+import json
 import warnings
+from concurrent.futures import ThreadPoolExecutor
 from contextvars import Context
+from dataclasses import FrozenInstanceError
+from threading import Lock
 
 import pytest
 
-from databricks_event_logger import (
-    CommonEvent,
-    ConsoleSink,
-    DeltaSink,
-    EventLogger,
-    EventSeverity,
-    EventStatus,
-    EventType,
-    assert_observability_ready,
-    check_observability_ready,
-    get_default_logger,
-    observe_notebook,
-    observed,
-)
 from databricks_event_logger.context import RuntimeContext
 from databricks_event_logger.errors import EventLoggerConfigurationError
-from databricks_event_logger.serialization import deserialize_metadata
+from databricks_event_logger.logger import (
+    EventLogger,
+    get_default_logger,
+    observed,
+    use_logger,
+)
 from databricks_event_logger.sinks.memory import MemorySink
 
 
-def test_record_event_stamps_config_context_and_correlation():
-    """
-    What: Emits one custom event with logger-level identity fields.
-    Why: Every event row should carry app/component/environment correlation data.
-    Fails when: Logger configuration stops propagating to emitted events.
-    """
+class FailingSink:
+    def __init__(self, error=None):
+        self.error = error if error is not None else RuntimeError("destination unavailable")
+
+    def emit(self, event):
+        raise self.error
+
+
+def test_direct_events_stamp_identity_and_normalize_numeric_metrics():
     sink = MemorySink()
+    context = RuntimeContext(job_id="10", run_id="20")
     logger = EventLogger(
-        app_name="app",
-        component="component",
-        environment="dev",
         sink=sink,
-        correlation_id="corr-1",
+        context=context,
+        app_name="positions",
+        component="publish",
+        environment="dev",
+        correlation_id="batch-1",
+    )
+    first = logger.record_event("positions.validated", row_count=7)
+    metric = logger.record_metric("rows", 7)
+    assert sink.events == [first, metric]
+    assert first.context == context
+    assert first.app_name == "positions"
+    assert first.component == "publish"
+    assert first.environment == "dev"
+    assert first.correlation_id == "batch-1"
+    assert metric.event_type == "metric"
+    assert metric.metric_value == 7.0
+    assert isinstance(metric.metric_value, float)
+    assert (logger.health.attempted, logger.health.succeeded, logger.health.failed) == (2, 2, 0)
+
+
+def test_default_correlation_is_independent_of_databricks_identity():
+    context = RuntimeContext(run_id="same-run")
+    assert (
+        EventLogger(context=context).correlation_id != EventLogger(context=context).correlation_id
     )
 
-    event = logger.record_event("reporting.checkpoint", metadata={"step": "ready"})
 
-    assert sink.events == [event]
-    assert event.app_name == "app"
-    assert event.component == "component"
-    assert event.environment == "dev"
-    assert event.correlation_id == "corr-1"
-
-
-def test_event_constants_are_accepted_as_event_fields():
-    """
-    What: Records an event using public event constants.
-    Why: Constants should reduce caller typos without changing persisted values.
-    Fails when: String enum constants leak enum names into event rows.
-    """
+def test_editable_scope_emits_one_result_with_computed_fields():
     sink = MemorySink()
-    logger = EventLogger(sink=sink)
-
-    event = logger.record_event(
-        CommonEvent.DELTA_WRITE,
-        event_type=EventType.DELTA_WRITE,
-        status=EventStatus.SUCCESS,
-        severity=EventSeverity.INFO,
-    )
-
-    assert event.event_name == "delta.write"
-    assert event.event_type == "delta_write"
-    assert event.status == "success"
-    assert event.severity == "info"
-
-
-def test_logger_derives_correlation_id_from_task_context():
-    """
-    What: Uses Databricks task context for the default correlation id.
-    Why: Events from the same task run should have a stable join key.
-    Fails when: Logger always falls back to a random UUID in Databricks jobs.
-    """
-    logger = EventLogger(
-        sink=MemorySink(),
-        context=RuntimeContext(
-            run_id="run-1",
-            task_key="publish",
-            task_attempt_number="2",
-        ),
-    )
-
-    assert logger.correlation_id == "run-1:publish:2"
-
-
-def test_logger_prefers_task_run_id_for_default_correlation_id():
-    """
-    What: Uses task_run_id when Databricks supplies it.
-    Why: task_run_id is the most precise task-run correlation identifier.
-    Fails when: A less specific run id is used despite task_run_id being known.
-    """
-    logger = EventLogger(
-        sink=MemorySink(),
-        context=RuntimeContext(
-            run_id="run-1",
-            task_key="publish",
-            task_run_id="task-run-1",
-        ),
-    )
-
-    assert logger.correlation_id == "task-run-1"
-
-
-def test_logger_uses_run_id_when_no_task_context_is_available():
-    """
-    What: Falls back to run_id when task-level Databricks fields are unavailable.
-    Why: Single-task jobs and some execution modes still need stable run correlation.
-    Fails when: The run_id-only branch falls back to a random UUID.
-    """
-    logger = EventLogger(
-        sink=MemorySink(),
-        context=RuntimeContext(run_id="run-1"),
-    )
-
-    assert logger.correlation_id == "run-1"
-
-
-def test_logged_event_records_success_and_return_value():
-    """
-    What: Decorates a successful function and returns the original result.
-    Why: Instrumentation should not change business function behavior.
-    Fails when: Decorators stop preserving return values or success status.
-    """
-    sink = MemorySink()
-    logger = EventLogger(sink=sink)
-
-    @logger.logged_event("reporting.build_positions")
-    def build_positions():
-        return 42
-
-    assert build_positions() == 42
-    assert sink.events[-1].event_name == "reporting.build_positions"
-    assert sink.events[-1].status == "success"
-    assert sink.events[-1].duration_ms is not None
-
-
-def test_logged_event_metadata_factory_uses_call_arguments():
-    """
-    What: Builds decorator metadata from runtime function arguments.
-    Why: Package-level instrumentation needs metadata such as ruleset/as_of_date at call time.
-    Fails when: Decorators only support import-time static metadata.
-    """
-    sink = MemorySink()
-    logger = EventLogger(sink=sink)
-
-    @logger.logged_event(
-        "reporting.apply_rules",
-        event_type="business_process",
-        metadata={"source": "decorator"},
-        metadata_factory=lambda df, *, ruleset, as_of_date: {
-            "df": df,
-            "ruleset": ruleset,
-            "as_of_date": as_of_date,
-        },
-    )
-    def apply_rules(df, *, ruleset: str, as_of_date: str):
-        return "ok"
-
-    assert apply_rules("positions", ruleset="MVE", as_of_date="2026-06-30") == "ok"
-    metadata = deserialize_metadata(sink.events[-1].metadata_json)
-
-    assert metadata == {
-        "as_of_date": "2026-06-30",
-        "df": "positions",
-        "ruleset": "MVE",
-        "source": "decorator",
+    logger = EventLogger(sink=sink, default_metadata={"batch": "one", "source": "default"})
+    with logger.event("positions.validate", metadata={"source": "scope"}) as scope:
+        event_id = scope.event_id
+        scope.metadata["partition"] = "2026-09-04"
+        scope.row_count = 0
+        scope.status = "warning"
+        scope.severity = "warning"
+        scope.source_table = "raw.positions"
+        scope.target_table = "curated.positions"
+        assert not sink.events
+        with pytest.raises(AttributeError):
+            scope.event_id = "different"
+    (event,) = sink.events
+    assert event.event_id == event_id
+    assert event.row_count == 0
+    assert event.status == event.severity == "warning"
+    assert event.source_table == "raw.positions"
+    assert event.target_table == "curated.positions"
+    assert event.start_ts <= event.end_ts
+    assert event.event_ts == event.end_ts
+    assert event.duration_ms >= 0
+    assert json.loads(event.metadata_json) == {
+        "batch": "one",
+        "source": "scope",
+        "partition": "2026-09-04",
     }
 
 
-def test_logged_event_metadata_factory_failure_does_not_block_function():
-    """
-    What: Continues running business code when metadata_factory raises.
-    Why: Optional call-time metadata should not become adoption-breaking business logic.
-    Fails when: A bad metadata_factory prevents the wrapped function from running.
-    """
+def test_parent_lineage_is_shared_by_bindings_but_not_independent_loggers():
     sink = MemorySink()
     logger = EventLogger(sink=sink)
-    calls = []
-
-    def broken_metadata_factory(value):
-        raise KeyError(f"missing-{value}")
-
-    @logger.logged_event(
-        "reporting.apply_rules",
-        metadata={"source": "decorator"},
-        metadata_factory=broken_metadata_factory,
-    )
-    def apply_rules(value):
-        calls.append(value)
-        return "ok"
-
-    with pytest.warns(RuntimeWarning, match="metadata_factory"):
-        assert apply_rules("positions") == "ok"
-    metadata = deserialize_metadata(sink.events[-1].metadata_json)
-
-    assert calls == ["positions"]
-    assert sink.events[-1].status == "success"
-    assert metadata["source"] == "decorator"
-    assert metadata["metadata_factory_error"] is True
-    assert metadata["metadata_factory_error_class"] == "KeyError"
-    assert "missing-positions" in metadata["metadata_factory_error_message"]
+    bound = logger.bind(batch="one")
+    unrelated = EventLogger(sink=sink)
+    with logger.event("outer") as outer:
+        bound.record_event("bound-checkpoint")
+        unrelated.record_event("independent-checkpoint")
+        with bound.event("inner") as inner:
+            logger.record_event("inside-inner")
+        logger.record_event("after-inner")
+    logger.record_event("after-outer")
+    events = {event.event_name: event for event in sink.events}
+    assert events["bound-checkpoint"].parent_event_id == outer.event_id
+    assert events["independent-checkpoint"].parent_event_id is None
+    assert events["inside-inner"].parent_event_id == inner.event_id
+    assert events["inner"].parent_event_id == outer.event_id
+    assert events["after-inner"].parent_event_id == outer.event_id
+    assert events["outer"].parent_event_id is None
+    assert events["after-outer"].parent_event_id is None
 
 
-def test_logged_event_records_failure_and_reraises_original_exception():
-    """
-    What: Decorates a failing function and re-raises its original exception.
-    Why: Databricks task failure semantics must remain driven by business code.
-    Fails when: Logging swallows, wraps, or masks business exceptions.
-    """
+def test_bound_metadata_and_scope_inputs_have_independent_top_level_snapshots():
+    supplied = {"nested": {"items": [1]}, "label": "root"}
     sink = MemorySink()
+    logger = EventLogger(sink=sink, default_metadata=supplied)
+    bound = logger.bind(label="bound")
+    supplied["label"] = "changed"
+    exposed = bound.default_metadata
+    exposed["label"] = "changed again"
+    scope_metadata = {"items": ["before"]}
+    manager = bound.event("scoped", metadata=scope_metadata)
+    scope_metadata["items"] = ["replaced"]
+    with manager as scope:
+        scope.metadata["items"].append("inside")
+    direct = logger.record_event("root")
+    assert json.loads(sink.events[0].metadata_json) == {
+        "nested": {"items": [1]},
+        "label": "bound",
+        "items": ["before", "inside"],
+    }
+    assert json.loads(direct.metadata_json) == {"nested": {"items": [1]}, "label": "root"}
+    assert bound.sink is logger.sink
+    assert bound.correlation_id == logger.correlation_id
+    assert bound.health == logger.health
+
+
+def test_health_is_an_immutable_snapshot_and_retains_last_failure():
+    sink = FailingSink()
     logger = EventLogger(sink=sink)
-
-    @logger.logged_event("reporting.fail")
-    def fail():
-        raise ValueError("boom")
-
-    with pytest.raises(ValueError, match="boom"):
-        fail()
-
-    assert sink.events[-1].event_name == "reporting.fail"
-    assert sink.events[-1].status == "failed"
-    assert sink.events[-1].error_class == "ValueError"
-    assert sink.events[-1].error_message == "boom"
-    assert sink.events[-1].stack_trace_hash
-
-
-def test_logged_event_metadata_factory_failure_preserves_business_exception():
-    """
-    What: Keeps the business failure when metadata_factory and business code both fail.
-    Why: Databricks task status should be driven by the original business exception.
-    Fails when: Factory exceptions mask the exception raised by the wrapped function.
-    """
-    sink = MemorySink()
-    logger = EventLogger(sink=sink)
-
-    def broken_metadata_factory():
-        raise RuntimeError("metadata failed")
-
-    @logger.logged_event(
-        "reporting.fail",
-        metadata_factory=broken_metadata_factory,
-    )
-    def fail():
-        raise ValueError("business failed")
-
-    with pytest.warns(RuntimeWarning, match="metadata_factory"):
-        with pytest.raises(ValueError, match="business failed"):
-            fail()
-    metadata = deserialize_metadata(sink.events[-1].metadata_json)
-
-    assert sink.events[-1].status == "failed"
-    assert sink.events[-1].error_class == "ValueError"
-    assert metadata["metadata_factory_error"] is True
-    assert metadata["metadata_factory_error_class"] == "RuntimeError"
-
-
-def test_context_manager_records_success_for_custom_block():
-    """
-    What: Records a custom block event when the block succeeds.
-    Why: Context managers are required v1 API for non-helper notebook blocks.
-    Fails when: Context manager usage stops emitting success events.
-    """
-    sink = MemorySink()
-    logger = EventLogger(sink=sink)
-
-    with logger.event("reporting.custom_block", target_table="silver.positions"):
-        value = "done"
-
-    assert value == "done"
-    assert sink.events[-1].event_name == "reporting.custom_block"
-    assert sink.events[-1].status == "success"
-    assert sink.events[-1].target_table == "silver.positions"
-
-
-def test_context_manager_records_failure_and_reraises():
-    """
-    What: Records a failed custom block and re-raises the original exception.
-    Why: Notebook block instrumentation should not hide failures from Databricks.
-    Fails when: Context manager failure handling changes exception behavior.
-    """
-    sink = MemorySink()
-    logger = EventLogger(sink=sink)
-
-    with pytest.raises(RuntimeError, match="bad block"):
-        with logger.event("reporting.custom_block"):
-            raise RuntimeError("bad block")
-
-    assert sink.events[-1].status == "failed"
-    assert sink.events[-1].error_class == "RuntimeError"
-
-
-def test_context_manager_preserves_source_and_target_on_failure():
-    """
-    What: Records table fields on a failed custom block.
-    Why: Failure diagnostics need the same source/target context as success events.
-    Fails when: Failure handling drops I/O context fields.
-    """
-    sink = MemorySink()
-    logger = EventLogger(sink=sink)
-
-    with pytest.raises(RuntimeError, match="bad block"):
-        with logger.event(
-            "reporting.custom_block",
-            source_table="bronze.positions",
-            target_table="silver.positions",
-        ):
-            raise RuntimeError("bad block")
-
-    assert sink.events[-1].source_table == "bronze.positions"
-    assert sink.events[-1].target_table == "silver.positions"
-
-
-def test_run_task_records_success_and_return_value():
-    """
-    What: Runs a task callable and records task success.
-    Why: Explicit task wrappers are required for reliable SDK lifecycle events.
-    Fails when: Task wrapper stops preserving callable return values.
-    """
-    sink = MemorySink()
-    logger = EventLogger(sink=sink)
-
-    result = logger.run_task("reporting.task", lambda value: value + 1, 2)
-
-    assert result == 3
-    assert sink.events[-1].event_name == "reporting.task"
-    assert sink.events[-1].event_type == "task"
-    assert sink.events[-1].status == "success"
-
-
-def test_run_task_records_failure_and_reraises_original_exception():
-    """
-    What: Runs a failing task callable and re-raises its original exception.
-    Why: Task wrapper logging must preserve Databricks job failure semantics.
-    Fails when: run_task swallows or replaces the business exception.
-    """
-    sink = MemorySink()
-    logger = EventLogger(sink=sink)
-
-    def fail():
-        raise ValueError("task boom")
-
-    with pytest.raises(ValueError, match="task boom"):
-        logger.run_task("reporting.task", fail)
-
-    assert sink.events[-1].event_name == "reporting.task"
-    assert sink.events[-1].event_type == "task"
-    assert sink.events[-1].status == "failed"
-    assert sink.events[-1].error_class == "ValueError"
-
-
-def test_record_metric_defaults_event_name():
-    """
-    What: Uses the metric name to build a default metric event name.
-    Why: Callers should not need to repeat metric names for common metrics.
-    Fails when: The metric event naming convention changes unexpectedly.
-    """
-    sink = MemorySink()
-    logger = EventLogger(sink=sink)
-
-    event = logger.record_metric("input_rows", 25)
-
-    assert event.event_name == "metric.input_rows"
-    assert event.metric_name == "input_rows"
-    assert event.metric_value == 25
-
-
-def test_nested_observed_events_capture_parent_event_id():
-    """
-    What: Records a nested direct event under an observed function event.
-    Why: Parent ids help dashboard users correlate sub-events with operations.
-    Fails when: Nested events lose their parent-child relationship.
-    """
-    sink = MemorySink()
-    logger = EventLogger(sink=sink)
-
-    @logger.logged_event("reporting.outer")
-    def outer():
-        child = logger.record_event("reporting.inner")
-        return child
-
-    child = outer()
-    outer_event = sink.events[-1]
-
-    assert child.parent_event_id == outer_event.event_id
-    assert outer_event.parent_event_id is None
-
-
-def test_observed_decorator_uses_default_logger_at_call_time():
-    """
-    What: Resolves the default logger when a decorated function is called.
-    Why: Import order should not decide whether decorators work in notebooks.
-    Fails when: @observed captures a missing logger at import time.
-    """
-    def run():
-        sink = MemorySink()
-        observe_notebook(
-            spark=object(),
-            dbutils=object(),
-            app_name="app",
-            component="component",
-            environment="dev",
-            sink=sink,
-        )
-
-        @observed("reporting.default_logger")
-        def work():
-            return "ok"
-
-        assert get_default_logger().config.app_name == "app"
-        assert work() == "ok"
-        assert sink.events[-1].event_name == "reporting.default_logger"
-
-    Context().run(run)
-
-
-def test_observed_metadata_factory_uses_default_logger_at_call_time():
-    """
-    What: Uses metadata_factory with the module-level default logger decorator.
-    Why: Owned packages should be able to decorate public APIs without inner wrappers.
-    Fails when: @observed cannot compute metadata from call arguments.
-    """
-    def run():
-        sink = MemorySink()
-        observe_notebook(
-            spark=object(),
-            dbutils=object(),
-            app_name="app",
-            component="component",
-            environment="dev",
-            sink=sink,
-        )
-
-        @observed(
-            "reporting.default_logger.dynamic",
-            metadata_factory=lambda value, *, batch_id: {
-                "value": value,
-                "batch_id": batch_id,
-            },
-        )
-        def work(value, *, batch_id):
-            return "ok"
-
-        assert work("input", batch_id="batch-1") == "ok"
-        metadata = deserialize_metadata(sink.events[-1].metadata_json)
-        assert metadata == {"batch_id": "batch-1", "value": "input"}
-
-    Context().run(run)
-
-
-def test_event_logger_defaults_to_console_sink():
-    """The default sink is visible notebook output, not implicit persistence."""
-    assert isinstance(EventLogger().sink, ConsoleSink)
-
-
-def test_observe_notebook_requires_explicit_runtime_dependencies():
-    """Notebook bootstrap has no frame or non-Databricks fallback."""
-    with pytest.raises(TypeError):
-        observe_notebook()
-    with pytest.raises(EventLoggerConfigurationError, match="requires both"):
-        observe_notebook(spark=None, dbutils=object())
-
-
-def test_observe_notebook_uses_explicit_configuration_and_correlation():
-    """Bootstrap passes explicit identity, sink, and correlation settings through."""
-    sink = MemorySink()
-
-    logger = observe_notebook(
-        spark=object(),
-        dbutils=object(),
-        app_name="app",
-        component="component",
-        environment="dev",
-        correlation_id="workflow-123",
-        sink=sink,
-    )
-
-    assert logger.config.app_name == "app"
-    assert logger.config.component == "component"
-    assert logger.config.environment == "dev"
-    assert logger.correlation_id == "workflow-123"
-    assert sink.events[-1].event_name == "notebook.started"
-    assert sink.events[-1].correlation_id == "workflow-123"
-
-
-def test_observe_notebook_uses_explicit_delta_sink():
-    """Delta persistence is explicit instead of inferred from a table parameter."""
-    pytest.importorskip("pyspark")
-    spark = FakeSpark()
-
-    logger = observe_notebook(
-        spark=spark,
-        dbutils=object(),
-        sink=DeltaSink(spark=spark, table_name="catalog.schema.event_log"),
-    )
-
-    assert isinstance(logger.sink, DeltaSink)
-    assert spark.sql_calls[0].startswith("INSERT INTO catalog.schema.event_log")
-    assert spark.data[0]["event_name"] == "notebook.started"
-
-
-def test_get_default_logger_requires_bootstrap():
-    """
-    What: Raises a clear configuration error when no default logger exists.
-    Why: Missing notebook bootstrap should be explicit instead of silently lost.
-    Fails when: The default logger silently creates unconfigured loggers.
-    """
-    with pytest.raises(EventLoggerConfigurationError):
-        Context().run(get_default_logger)
-
-
-def test_logging_failure_warns_and_preserves_success_return_value():
-    """
-    What: Lets successful business code return even when event emission fails.
-    Why: V1 logging should not fail successful business workflows.
-    Fails when: Sink failures replace successful function results.
-    """
+    child = logger.bind(batch="one")
+    original = logger.health
+    with pytest.warns(RuntimeWarning, match="Event delivery failed"):
+        assert child.record_event("failed") is None
+    failed = logger.health
+    assert (original.attempted, original.failed) == (0, 0)
+    assert (failed.attempted, failed.succeeded, failed.failed) == (1, 0, 1)
+    assert failed.last_error == "RuntimeError: destination unavailable"
+    with pytest.raises(FrozenInstanceError):
+        failed.failed = 0
+    logger.sink = MemorySink()
+    assert logger.record_event("recovered") is not None
+    assert logger.health.succeeded == 1
+    assert logger.health.last_error == failed.last_error
+
+
+@pytest.mark.parametrize("strict", [False, True])
+@pytest.mark.parametrize(
+    "business_error",
+    [ValueError("business"), KeyboardInterrupt(), SystemExit(17), asyncio.CancelledError()],
+)
+def test_original_business_exception_survives_any_sink_failure_and_error_warnings(
+    strict,
+    business_error,
+):
+    logger = EventLogger(sink=FailingSink(SystemExit("sink-exit")), strict_logging=strict)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        with pytest.raises(type(business_error)) as captured:
+            with logger.event("operation"):
+                raise business_error
+    assert captured.value is business_error
+    assert logger.health.failed == 1
+    logger.sink = MemorySink()
+    assert logger.record_event("after").parent_event_id is None
+
+
+def test_nonstrict_sink_failure_does_not_interrupt_success_with_warning_errors():
     logger = EventLogger(sink=FailingSink())
-
-    @logger.logged_event("reporting.success")
-    def work():
-        return "ok"
-
-    with pytest.warns(RuntimeWarning, match="Failed to emit event"):
-        assert work() == "ok"
-
-
-def test_strict_logging_raises_sink_failure_on_success_path():
-    """
-    What: Raises sink errors when strict logging is explicitly enabled.
-    Why: Production controls may require event persistence to be mandatory.
-    Fails when: strict_logging=True still silently warns and continues.
-    """
-    logger = EventLogger(sink=FailingSink(), strict_logging=True)
-
-    @logger.logged_event("reporting.success")
-    def work():
-        return "ok"
-
-    with pytest.raises(RuntimeError, match="sink unavailable"):
-        work()
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        assert logger.record_event("checkpoint") is None
+        with logger.event("operation"):
+            result = 42
+    assert result == 42
+    assert logger.health.failed == 2
 
 
-def test_failure_logging_failure_preserves_original_exception():
-    """
-    What: Re-raises the business exception when failure-event emission fails.
-    Why: A broken sink must not mask the exception that should fail the task.
-    Fails when: Logging exceptions replace business exceptions.
-    """
-    logger = EventLogger(sink=FailingSink())
+def test_strict_delivery_failure_is_raised_once_after_work_and_parent_is_restored():
+    error = RuntimeError("sink unavailable")
+    logger = EventLogger(sink=FailingSink(error), strict_logging=True)
+    completed = []
+    with pytest.raises(RuntimeError) as captured:
+        with logger.event("operation"):
+            completed.append(True)
+    assert captured.value is error
+    assert completed == [True]
+    assert (logger.health.attempted, logger.health.failed) == (1, 1)
+    logger.sink = MemorySink()
+    assert logger.record_event("after").parent_event_id is None
 
-    @logger.logged_event("reporting.failure")
-    def fail():
-        raise ValueError("business failure")
 
-    with pytest.warns(RuntimeWarning, match="Failed to emit event"):
+@pytest.mark.parametrize("strict", [False, True])
+def test_metadata_preparation_failure_obeys_delivery_policy(monkeypatch, strict):
+    logger = EventLogger(sink=MemorySink(), strict_logging=strict)
+
+    def broken_serializer(*args, **kwargs):
+        raise RuntimeError("normalization failed")
+
+    monkeypatch.setattr("databricks_event_logger.logger.serialize_metadata", broken_serializer)
+    if strict:
+        with pytest.raises(RuntimeError, match="normalization failed"):
+            logger.record_event("checkpoint", metadata={"value": "one"})
+    else:
+        with pytest.warns(RuntimeWarning):
+            assert logger.record_event("checkpoint", metadata={"value": "one"}) is None
+    assert (logger.health.attempted, logger.health.failed) == (1, 1)
+    assert not logger.sink.events
+
+
+def test_bad_exception_string_and_metadata_repr_do_not_replace_business_failure():
+    class BadMessage(ValueError):
+        def __str__(self):
+            raise RuntimeError("bad str")
+
+    class BadRepr:
+        def __repr__(self):
+            raise RuntimeError("bad repr")
+
+    sink = MemorySink()
+    logger = EventLogger(sink=sink, capture_error_frames=True)
+    error = BadMessage()
+    with pytest.raises(BadMessage) as captured:
+        with logger.event("operation", metadata={"object": BadRepr()}):
+            raise error
+    assert captured.value is error
+    assert sink.events[0].status == "failed"
+    assert sink.events[0].error_class == "BadMessage"
+    assert logger.health.succeeded == 1
+
+
+def test_metadata_snapshots_do_not_copy_unsupported_python_objects():
+    sink = MemorySink()
+    logger = EventLogger(sink=sink, default_metadata={"lock": Lock()})
+    bound = logger.bind(second_lock=Lock())
+    with bound.event("operation", metadata={"third_lock": Lock()}):
+        pass
+    values = json.loads(sink.events[0].metadata_json)
+    assert set(values) == {"lock", "second_lock", "third_lock"}
+    assert all(value == "[UNSUPPORTED]" for value in values.values())
+
+
+def test_delivery_diagnostics_with_raising_str_preserve_business_error():
+    class UnprintableFailure(Exception):
+        def __str__(self):
+            raise KeyboardInterrupt()
+
+    logger = EventLogger(sink=FailingSink(UnprintableFailure()), strict_logging=True)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        with pytest.raises(ValueError, match="original"):
+            with logger.event("operation"):
+                raise ValueError("original")
+    assert logger.health.last_error == "UnprintableFailure: [UNPRINTABLE]"
+
+
+def test_bound_loggers_share_consistent_health_across_threads():
+    logger = EventLogger(sink=MemorySink())
+
+    def record(index):
+        child = logger.bind(index=index)
+        for _ in range(30):
+            child.record_event("checkpoint")
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        list(pool.map(record, range(8)))
+    health = logger.health
+    assert health.attempted == health.succeeded == 240
+    assert health.failed == 0
+
+
+def test_failure_overrides_edited_status_and_captures_bounded_frames_without_locals():
+    sink = MemorySink()
+    logger = EventLogger(sink=sink, capture_error_frames=True, error_message_max_chars=5)
+
+    def recurse(depth):
+        secret_local = "do-not-include-local-value"
+        if depth:
+            return recurse(depth - 1)
+        raise ValueError("long message" if secret_local else "unused")
+
+    with pytest.raises(ValueError):
+        with logger.event("operation", status="skipped", severity="debug"):
+            recurse(25)
+    (event,) = sink.events
+    assert event.status == "failed"
+    assert event.severity == "error"
+    assert len(event.error_message) <= 5
+    assert len(event.stack_trace_hash) == 64
+    frames = json.loads(event.error_frames_json)
+    assert len(frames) == 20
+    assert all(set(frame) == {"file", "function", "line"} for frame in frames)
+    assert all("/" not in frame["file"] and "\\" not in frame["file"] for frame in frames)
+    assert "do-not-include-local-value" not in event.error_frames_json
+
+
+def test_error_frame_capture_is_opt_in():
+    sink = MemorySink()
+    logger = EventLogger(sink=sink)
+    with pytest.raises(ValueError):
+        with logger.event("operation"):
+            raise ValueError("business failure")
+    assert sink.events[0].error_frames_json is None
+    assert sink.events[0].stack_trace_hash
+
+
+@pytest.mark.parametrize(
+    "method,kwargs",
+    [
+        ("event", {"event_name": ""}),
+        ("event", {"event_name": "bad", "row_count": -1}),
+        ("event", {"event_name": "bad", "status": "invalid"}),
+        ("event", {"event_name": "bad", "metadata": []}),
+        ("logged_event", {"event_name": ""}),
+        ("record_event", {"event_name": "bad", "metric_value": True}),
+    ],
+)
+def test_static_invalid_arguments_raise_without_counting_delivery(method, kwargs):
+    logger = EventLogger(sink=MemorySink())
+    with pytest.raises((TypeError, ValueError)):
+        getattr(logger, method)(**kwargs)
+    assert logger.health.attempted == 0
+    assert logger.record_event("after").parent_event_id is None
+
+
+def test_invalid_edited_result_is_a_preparation_failure_and_preserves_business_error():
+    sink = MemorySink()
+    logger = EventLogger(sink=sink)
+    with pytest.warns(RuntimeWarning):
+        with logger.event("operation") as scope:
+            scope.row_count = -1
+    assert logger.health.failed == 1
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
         with pytest.raises(ValueError, match="business failure"):
-            fail()
+            with logger.event("operation") as scope:
+                scope.row_count = -1
+                raise ValueError("business failure")
+    assert logger.health.failed == 2
+    assert not sink.events
 
 
-def test_default_metadata_merges_with_event_metadata():
-    """
-    What: Applies logger-level default metadata to emitted events.
-    Why: Production jobs need run-level metadata without repeating it at every call site.
-    Fails when: default_metadata is dropped or overrides event-level metadata.
-    """
+def test_sync_decorators_and_task_wrapper_share_lifecycle_and_return_values():
     sink = MemorySink()
-    logger = EventLogger(
-        sink=sink,
-        default_metadata={"workflow": "daily_positions", "stage": "default"},
-    )
+    logger = EventLogger(sink=sink)
 
-    event = logger.record_event("reporting.step", metadata={"stage": "custom"})
-    metadata = deserialize_metadata(event.metadata_json)
+    @logger.logged_event("function", metadata={"label": "one"})
+    def operation(value):
+        """Function docs survive wrapping."""
+        logger.record_event("checkpoint")
+        return value * 2
 
-    assert metadata == {"stage": "custom", "workflow": "daily_positions"}
-
-
-def test_logger_builds_job_navigation_urls_from_context():
-    """
-    What: Derives Databricks job and run UI links from runtime context.
-    Why: Dashboards and notebooks should offer one-click navigation to the run.
-    Fails when: URL derivation drops workspace, job, or run identifiers.
-    """
-    logger = EventLogger(
-        sink=MemorySink(),
-        context=RuntimeContext(
-            workspace_url="Example.Cloud.Databricks.com/",
-            job_id="123",
-            run_id="456",
-        ),
-    )
-
-    assert logger.job_url == "https://example.cloud.databricks.com/jobs/123"
-    assert logger.job_run_url == "https://example.cloud.databricks.com/jobs/123/runs/456"
+    assert operation.__name__ == "operation"
+    assert operation.__doc__ == "Function docs survive wrapping."
+    assert logger.run_task("task", operation, 4) == 8
+    checkpoint, function, task = sink.events
+    assert checkpoint.parent_event_id == function.event_id
+    assert function.parent_event_id == task.event_id
+    assert task.parent_event_id is None
+    assert task.event_type == "task"
+    assert json.loads(function.metadata_json) == {"label": "one"}
 
 
-def test_observe_notebook_started_event_includes_bootstrap_diagnostics():
-    """
-    What: Adds sink and navigation diagnostics to the startup event metadata.
-    Why: Misconfiguration should be visible from the first event in a run.
-    Fails when: notebook.started omits production bootstrap details.
-    """
+def test_async_decorator_awaits_actual_work_and_tracks_failure_and_cancellation():
     sink = MemorySink()
+    logger = EventLogger(sink=sink)
 
-    logger = observe_notebook(
-        spark=object(),
-        dbutils=object(),
-        app_name="app",
-        component="component",
-        environment="dev",
-        sink=sink,
-        strict_logging=True,
-    )
-    metadata = deserialize_metadata(sink.events[-1].metadata_json)
+    @logger.logged_event("async-operation")
+    async def operation(error=None):
+        await asyncio.sleep(0)
+        logger.record_event("checkpoint")
+        if error is not None:
+            raise error
+        return 42
 
-    assert logger is get_default_logger()
-    assert metadata["sink_type"] == "MemorySink"
-    assert metadata["strict_logging"] is True
-    assert metadata["event_table"] is None
+    async def scenario():
+        coroutine = operation()
+        assert not sink.events
+        assert await coroutine == 42
+        error = ValueError("async business failure")
+        with pytest.raises(ValueError) as captured:
+            await operation(error)
+        assert captured.value is error
+        with pytest.raises(asyncio.CancelledError):
+            await logger.run_task("async-task", operation, asyncio.CancelledError())
 
-
-def test_event_volume_warning_emits_once():
-    """
-    What: Warns once when a logger emits more events than the configured threshold.
-    Why: Immediate Delta writes should discourage unexpectedly chatty instrumentation.
-    Fails when: High-volume event loops stay invisible to developers.
-    """
-    logger = EventLogger(sink=MemorySink(), max_events_warning_threshold=1)
-
-    logger.record_event("reporting.first")
-    with pytest.warns(RuntimeWarning, match="more than 1 events"):
-        logger.record_event("reporting.second")
-    with warnings.catch_warnings(record=True) as warning_records:
-        warnings.simplefilter("always")
-        logger.record_event("reporting.third")
-
-    assert not warning_records
+    asyncio.run(scenario())
+    operations = [event for event in sink.events if event.event_name == "async-operation"]
+    assert [event.status for event in operations] == ["success", "failed", "failed"]
+    assert sink.events[-1].status == "failed"
+    assert sink.events[-1].error_class == "CancelledError"
+    assert logger.record_event("after").parent_event_id is None
 
 
-def test_check_observability_ready_uses_console_sink_by_default():
-    """Readiness reports the same explicit default used by EventLogger."""
-    report = check_observability_ready(
-        dbutils=object(),
-        spark=object(),
-        validate_sink=False,
-    )
+def test_async_concurrent_siblings_keep_their_own_parent_context():
+    sink = MemorySink()
+    logger = EventLogger(sink=sink)
 
-    assert report.ready is True
-    assert report.sink_type == "ConsoleSink"
-    assert report.event_table is None
+    async def worker(name, ready, release):
+        with logger.event(name) as scope:
+            ready.set()
+            await release.wait()
+            child = logger.bind(worker=name).record_event(f"{name}.child")
+            assert child.parent_event_id == scope.event_id
 
+    async def scenario():
+        ready_a, ready_b, release = asyncio.Event(), asyncio.Event(), asyncio.Event()
+        with logger.event("parent") as parent:
+            first = asyncio.create_task(worker("a", ready_a, release))
+            second = asyncio.create_task(worker("b", ready_b, release))
+            await ready_a.wait()
+            await ready_b.wait()
+            release.set()
+            await asyncio.gather(first, second)
+            assert logger.record_event("parent.checkpoint").parent_event_id == parent.event_id
 
-def test_assert_observability_ready_returns_report_when_ready():
-    """
-    What: Returns a readiness report when required production inputs are present.
-    Why: Production notebooks need a compact preflight check.
-    Fails when: The assert helper emits events or rejects valid basic configuration.
-    """
-    report = assert_observability_ready(
-        dbutils=object(),
-        spark=object(),
-        sink=MemorySink(),
-        validate_sink=False,
-    )
-
-    assert report.ready is True
-    assert report.sink_type == "MemorySink"
-    assert report.event_table is None
-
-
-def test_check_observability_ready_reports_delta_validation_failure():
-    """
-    What: Reports DeltaSink schema validation failures without emitting events.
-    Why: Preflight checks should catch bad event table deployment before bootstrap.
-    Fails when: Readiness diagnostics ignore a malformed event log table.
-    """
-    spark = FakeSpark(describe_columns=["event_name"])
-    sink = DeltaSink(spark=spark, table_name="catalog.schema.event_log")
-
-    report = check_observability_ready(
-        dbutils=object(),
-        spark=spark,
-        sink=sink,
-        validate_sink=True,
-    )
-
-    assert report.ready is False
-    assert report.sink_type == "DeltaSink"
-    assert "missing required columns" in report.issues[0]
+    asyncio.run(scenario())
+    events = {event.event_name: event for event in sink.events}
+    assert events["a"].parent_event_id == events["parent"].event_id
+    assert events["b"].parent_event_id == events["parent"].event_id
+    assert events["a.child"].parent_event_id != events["b.child"].parent_event_id
+    assert logger.health.succeeded == 6
 
 
-class FakeSpark:
-    def __init__(self, describe_columns=None):
-        self.data = None
-        self.dataframe = FakeDataFrame()
-        self.sql_calls = []
-        self.describe_columns = describe_columns
+def test_generator_functions_are_rejected_before_lazy_work_is_misreported():
+    logger = EventLogger(sink=MemorySink())
 
-    def createDataFrame(self, data, schema=None):  # noqa: N802 - Spark API casing.
-        self.data = data
-        return self.dataframe
+    def generator():
+        yield 1
 
-    def sql(self, query):
-        normalized = " ".join(query.split())
-        self.sql_calls.append(normalized)
-        if normalized.startswith("DESCRIBE TABLE"):
-            return FakeDescribeResult(self.describe_columns or [])
+    async def async_generator():
+        yield 1
 
-
-class FakeDataFrame:
-    def createOrReplaceTempView(self, name):  # noqa: N802 - Spark API casing.
-        self.view_name = name
+    for function in (generator, async_generator):
+        with pytest.raises(TypeError, match="Generator functions"):
+            logger.logged_event("generator")(function)
+        with pytest.raises(TypeError, match="Generator functions"):
+            observed("generator")(function)
+        with pytest.raises(TypeError, match="Generator functions"):
+            logger.run_task("generator", function)
+    assert not logger.sink.events
 
 
-class FakeDescribeResult:
-    def __init__(self, columns):
-        self.columns = columns
+def test_scoped_default_is_resolved_on_call_and_restored_even_after_failure():
+    first, second = EventLogger(sink=MemorySink()), EventLogger(sink=MemorySink())
 
-    def collect(self):
-        return [{"col_name": column} for column in self.columns]
+    @observed("operation")
+    def operation():
+        return "done"
+
+    def scenario():
+        with pytest.raises(EventLoggerConfigurationError, match="use_logger"):
+            operation()
+        with use_logger(first):
+            assert operation() == "done"
+            with pytest.raises(ValueError), use_logger(second):
+                assert get_default_logger() is second
+                operation()
+                raise ValueError("leave inner default")
+            assert get_default_logger() is first
+            operation()
+        with pytest.raises(EventLoggerConfigurationError):
+            get_default_logger()
+
+    Context().run(scenario)
+    assert len(first.sink.events) == 2
+    assert len(second.sink.events) == 1
 
 
-class FailingSink:
-    def emit(self, event):
-        raise RuntimeError("sink unavailable")
+@pytest.mark.parametrize(
+    "settings",
+    [
+        {"metadata_max_bytes": 1},
+        {"metadata_max_bytes": True},
+        {"metadata_string_max_chars": -1},
+        {"error_message_max_chars": -1},
+        {"error_message_max_chars": True},
+        {"sink": object()},
+    ],
+)
+def test_invalid_configuration_is_rejected_at_construction(settings):
+    with pytest.raises((TypeError, ValueError)):
+        EventLogger(**settings)

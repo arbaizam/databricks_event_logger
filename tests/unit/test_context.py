@@ -1,221 +1,78 @@
 import json
+from types import SimpleNamespace
 
-from databricks_event_logger.context import RuntimeContext, resolve_databricks_context
+import pytest
 
-
-class FakeSparkConf:
-    def __init__(self, values):
-        self._values = values
-
-    def get(self, key):
-        return self._values[key]
+from databricks_event_logger.context import RuntimeContext
+from databricks_event_logger.databricks import resolve_context
 
 
-class FakeSpark:
-    def __init__(self, values):
-        self.conf = FakeSparkConf(values)
+def notebook_runtime(raw_json):
+    context = SimpleNamespace(toJson=lambda: raw_json)
+    notebook = SimpleNamespace(getContext=lambda: context)
+    proxy = SimpleNamespace(notebook=lambda: notebook)
+    return SimpleNamespace(
+        notebook=SimpleNamespace(entry_point=SimpleNamespace(getDbutils=lambda: proxy))
+    )
 
 
-def test_runtime_context_from_mapping_ignores_unknown_fields():
-    """
-    What: Builds context from partial mappings and ignores unknown keys.
-    Why: Callers and tests may supply context dictionaries with extra fields.
-    Fails when: Unknown context fields break logger initialization.
-    """
-    context = RuntimeContext.from_mapping({"job_id": 123, "unknown": "ignored"})
-
-    assert context.job_id == "123"
-    assert context.run_id is None
-
-
-def test_runtime_context_normalizes_workspace_url():
-    """
-    What: Normalizes workspace URLs to a bare lowercase hostname.
-    Why: Dashboard filters should not split rows by scheme or trailing slash.
-    Fails when: Context sources produce inconsistent workspace_url values.
-    """
+def test_explicit_context_normalizes_values_and_builds_links():
     context = RuntimeContext.from_mapping(
-        {
-            "workspace_url": "https://ADB-123.azuredatabricks.net/",
-        }
+        {"job_id": 123, "run_id": 456, "workspace_url": " https://ADB-123.example.net/path "}
     )
-
-    assert context.workspace_url == "adb-123.azuredatabricks.net"
-
-
-def test_context_resolver_uses_standard_username_env_var(monkeypatch):
-    """
-    What: Resolves username from the standard Databricks SDK environment name.
-    Why: Non-standard environment keys should not be the only env fallback path.
-    Fails when: Environment context misses DATABRICKS_USERNAME.
-    """
-    monkeypatch.setenv("DATABRICKS_USERNAME", "user@example.com")
-    monkeypatch.setenv("DATABRICKS_HOST", "https://ADB-123.azuredatabricks.net/")
-
-    context = resolve_databricks_context(dbutils=object(), spark=FakeSpark({}))
-
-    assert context.user_name == "user@example.com"
-    assert context.workspace_url == "adb-123.azuredatabricks.net"
-
-
-def test_context_resolver_uses_spark_config_when_available():
-    """
-    What: Resolves Spark configuration fields without Databricks imports.
-    Why: The package should capture available context while remaining lightweight.
-    Fails when: Spark-backed context resolution requires PySpark type imports.
-    """
-    spark = FakeSpark(
-        {
-            "spark.databricks.clusterUsageTags.clusterId": "cluster-1",
-            "spark.databricks.clusterUsageTags.clusterOwnerOrgId": "workspace-1",
-        }
-    )
-
-    context = resolve_databricks_context(dbutils=object(), spark=spark)
-
-    assert context.cluster_id == "cluster-1"
-    assert context.workspace_id == "workspace-1"
-
-
-def test_context_resolver_uses_dbutils_context_json_for_job_fields():
-    """
-    What: Resolves job/task fields from Databricks context JSON.
-    Why: Job-task metadata may appear in toJson() even when tag access is sparse.
-    Fails when: Job runs emit null job_id/run_id/task_key/notebook_path fields.
-    """
-    payload = {
-        "currentRunId": {"id": 456},
-        "tags": {
-            "jobId": "123",
-            "taskKey": "smoke_task",
-            "taskRunId": "789",
-            "taskAttemptNumber": "2",
-            "jobTriggerType": "one_time",
-            "browserHostName": "adb-123.azuredatabricks.net",
-        },
-        "extraContext": {
-            "job_start_time": "2026-06-04T13:00:00Z",
-            "notebook_path": "/Repos/team/event_logger_smoke",
-            "user": "user@example.com",
-            "run_as_user_name": "svc@example.com",
-        },
-    }
-    dbutils = FakeDbutils(FakeNotebookContext(json_payload=payload))
-
-    context = resolve_databricks_context(dbutils=dbutils, spark=FakeSpark({}))
-
     assert context.job_id == "123"
+    assert context.workspace_url == "adb-123.example.net"
+    assert context.job_run_url == "https://adb-123.example.net/jobs/123/runs/456"
+    assert context.as_dict()["task_key"] is None
+    assert RuntimeContext().job_url is None
+    assert RuntimeContext(job_id="123").job_run_url is None
+
+
+def test_context_rejects_typo_and_complex_identity_values():
+    with pytest.raises(TypeError):
+        RuntimeContext.from_mapping({"jobid": "123"})
+    with pytest.raises(TypeError, match="job_id"):
+        RuntimeContext.from_mapping({"job_id": {"id": 123}})
+    with pytest.raises(TypeError, match="mapping"):
+        RuntimeContext.from_mapping([])
+
+
+def test_discovery_enriches_explicit_values_without_overriding_them():
+    runtime = notebook_runtime(json.dumps({
+        "tags": {"jobId": "123", "jobRunId": "456", "orgId": "9"},
+        "extraContext": {"notebook_path": "/Workspace/task", "user": "engineer"},
+    }))
+    context = resolve_context(dbutils=runtime, values={"job_id": "override", "user_name": None})
+    assert context.job_id == "override"
     assert context.run_id == "456"
-    assert context.task_key == "smoke_task"
+    assert context.workspace_id == "9"
+    assert context.notebook_path == "/Workspace/task"
+    assert context.user_name is None
+
+
+@pytest.mark.parametrize("raw_json", ["null", "[]", '"text"', "0", "invalid", "{}"])
+def test_malformed_or_missing_runtime_context_preserves_explicit_values(raw_json):
+    context = resolve_context(dbutils=notebook_runtime(raw_json), values={"run_id": "123"})
+    assert context == RuntimeContext(run_id="123")
+
+
+def test_restricted_runtime_does_not_require_spark_or_fallback_probing():
+    assert resolve_context(dbutils=object()) == RuntimeContext()
+    assert resolve_context(values={"task_key": "load"}) == RuntimeContext(task_key="load")
+    assert resolve_context() == RuntimeContext()
+
+
+def test_discovery_does_not_confuse_current_task_run_with_job_run():
+    runtime = notebook_runtime('{"currentRunId":{"id":456},"tags":{"taskRunId":"789"}}')
+    context = resolve_context(dbutils=runtime)
+    assert context.run_id is None
     assert context.task_run_id == "789"
-    assert context.task_attempt_number == "2"
-    assert context.job_start_time == "2026-06-04T13:00:00Z"
-    assert context.job_trigger_type == "one_time"
-    assert context.notebook_path == "/Repos/team/event_logger_smoke"
-    assert context.workspace_url == "adb-123.azuredatabricks.net"
-    assert context.user_name == "user@example.com"
-    assert context.run_as_user_name == "svc@example.com"
 
 
-def test_context_resolver_uses_dbutils_tags_when_json_is_unavailable():
-    """
-    What: Resolves job/task fields from Databricks context tags.
-    Why: Some runtime contexts expose tags but not parseable JSON.
-    Fails when: Tag-only contexts stop populating job metadata.
-    """
-    dbutils = FakeDbutils(
-        FakeNotebookContext(
-            tags={
-                "jobId": "123",
-                "jobRunId": "456",
-                "taskKey": "smoke_task",
-                "taskRunId": "789",
-                "taskAttemptNumber": "1",
-                "notebookPath": "/Workspace/smoke",
-            }
-        )
-    )
-
-    context = resolve_databricks_context(dbutils=dbutils, spark=FakeSpark({}))
-
-    assert context.job_id == "123"
-    assert context.run_id == "456"
-    assert context.task_key == "smoke_task"
-    assert context.task_run_id == "789"
-    assert context.task_attempt_number == "1"
-    assert context.notebook_path == "/Workspace/smoke"
-
-
-class FakeDbutils:
-    def __init__(self, context):
-        self.notebook = FakeNotebook(context)
-
-
-class FakeNotebook:
-    def __init__(self, context):
-        self.entry_point = FakeEntryPoint(context)
-
-    def __call__(self):
-        return self
-
-    def getContext(self):
-        return self.entry_point.getDbutils().notebook().getContext()
-
-
-class FakeEntryPoint:
-    def __init__(self, context):
-        self._context = context
-
-    def getDbutils(self):
-        return FakeDbutilsProxy(self._context)
-
-
-class FakeDbutilsProxy:
-    def __init__(self, context):
-        self._context = context
-
-    def notebook(self):
-        return FakeNotebookProxy(self._context)
-
-
-class FakeNotebookProxy:
-    def __init__(self, context):
-        self._context = context
-
-    def getContext(self):
-        return self._context
-
-
-class FakeNotebookContext:
-    def __init__(self, *, json_payload=None, tags=None):
-        self._json_payload = json_payload
-        self._tags = tags or {}
-
-    def toJson(self):
-        if self._json_payload is None:
-            raise RuntimeError("no json")
-        return json.dumps(self._json_payload)
-
-    def tags(self):
-        return FakeTags(self._tags)
-
-
-class FakeTags:
-    def __init__(self, values):
-        self._values = values
-
-    def get(self, key):
-        if key not in self._values:
-            return FakeOption(None)
-        return FakeOption(self._values[key])
-
-
-class FakeOption:
-    def __init__(self, value):
-        self._value = value
-
-    def isDefined(self):
-        return self._value is not None
-
-    def get(self):
-        return self._value
+def test_invalid_explicit_values_are_not_swallowed_as_discovery_failures():
+    with pytest.raises(TypeError):
+        resolve_context(dbutils=object(), values={"runid": "123"})
+    with pytest.raises(ValueError, match="workspace_url"):
+        resolve_context(values={"workspace_url": "ftp://example.net"})
+    with pytest.raises(TypeError, match="mapping"):
+        resolve_context(values=[])

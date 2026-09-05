@@ -1,43 +1,42 @@
-"""Structured event logging helpers for Databricks workloads."""
+"""Structured events and editable operation scopes with explicit delivery."""
 
-from databricks_event_logger.decorators import observed
-from databricks_event_logger.diagnostics import (
-    ObservabilityReadinessReport,
-    assert_observability_ready,
-    check_observability_ready,
-)
+from databricks_event_logger.context import RuntimeContext
+from databricks_event_logger.event import EventRecord
 from databricks_event_logger.events import (
-    CommonEvent,
     EventSeverity,
     EventStatus,
     EventType,
 )
 from databricks_event_logger.logger import (
+    DeliveryHealth,
     EventLogger,
+    EventScope,
     get_default_logger,
-    observe_notebook,
-    set_default_logger,
+    observed,
+    use_logger,
 )
+from databricks_event_logger.sinks.base import EventSink
 from databricks_event_logger.sinks.console import ConsoleSink
-from databricks_event_logger.sinks.delta import DeltaSink
+from databricks_event_logger.sinks.delta import DeltaSink, create_table_sql
 from databricks_event_logger.sinks.memory import MemorySink
 from databricks_event_logger.version import __version__
 
 __all__ = [
     "ConsoleSink",
-    "CommonEvent",
+    "DeliveryHealth",
     "DeltaSink",
     "EventLogger",
+    "EventRecord",
+    "EventScope",
     "EventSeverity",
+    "EventSink",
     "EventStatus",
     "EventType",
     "MemorySink",
-    "ObservabilityReadinessReport",
+    "RuntimeContext",
     "__version__",
-    "assert_observability_ready",
-    "check_observability_ready",
+    "create_table_sql",
     "get_default_logger",
-    "observe_notebook",
     "observed",
-    "set_default_logger",
+    "use_logger",
 ]

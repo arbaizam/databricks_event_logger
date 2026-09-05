@@ -1,18 +1,11 @@
-"""
-Metadata serialization helpers.
-
-Metadata remains caller-configurable in v1: there are no key allowlists and the
-logger does not reject arbitrary diagnostic fields. The serializer still applies
-production-safe hygiene by default: sensitive-looking keys are redacted, long
-strings can be truncated, and the final JSON payload can be capped to a maximum
-byte size.
-"""
+"""Normalize and redact metadata once before JSON encoding."""
 
 from __future__ import annotations
 
 import json
+import math
 from collections.abc import Mapping
-from dataclasses import asdict, is_dataclass
+from dataclasses import fields, is_dataclass
 from datetime import date, datetime
 from decimal import Decimal
 from enum import Enum
@@ -20,53 +13,27 @@ from pathlib import Path
 from typing import Any
 
 DEFAULT_REDACT_KEYS = (
-    "password",
-    "token",
-    "secret",
-    "credential",
-    "api_key",
-    "access_key",
-    "private_key",
+    "password", "token", "secret", "credential", "api_key", "access_key", "private_key",
 )
 DEFAULT_METADATA_MAX_BYTES = 4000
 DEFAULT_METADATA_STRING_MAX_CHARS = 2000
 TRUNCATED_MARKER = "...[TRUNCATED]"
 REDACTED_VALUE = "[REDACTED]"
+DEPTH_LIMIT_VALUE = "[DEPTH_LIMIT]"
+UNSUPPORTED_VALUE = "[UNSUPPORTED]"
 
 
-def json_default(value: Any) -> Any:
+def safe_text(value: Any, *, max_chars: int | None = 2000) -> str:
+    """Get bounded diagnostic text, tolerating a broken ``__str__`` method.
+
+    This is for error reporting, not metadata conversion or secret redaction.
+    It never calls ``repr``. Metadata uses a fixed marker for unknown objects.
     """
-    Convert common non-JSON values into JSON-compatible values.
-
-    Parameters
-    ----------
-    value : Any
-        Value passed by ``json.dumps`` when the default encoder cannot handle
-        it.
-
-    Returns
-    -------
-    Any
-        JSON-compatible representation.
-
-    Notes
-    -----
-    ``repr`` is the final fallback because observability metadata should never
-    fail business processing solely due to a non-serializable diagnostic value.
-    """
-    if isinstance(value, datetime | date):
-        return value.isoformat()
-    if isinstance(value, Decimal):
-        return str(value)
-    if isinstance(value, Enum):
-        return value.value
-    if isinstance(value, Path):
-        return str(value)
-    if is_dataclass(value) and not isinstance(value, type):
-        return asdict(value)
-    if isinstance(value, set | frozenset):
-        return sorted(value, key=repr)
-    return repr(value)
+    try:
+        result = str(value)
+    except BaseException:
+        result = "[UNPRINTABLE]"
+    return _truncate_string(result, max_chars)
 
 
 def sanitize_metadata(
@@ -76,40 +43,64 @@ def sanitize_metadata(
     string_max_chars: int | None = DEFAULT_METADATA_STRING_MAX_CHARS,
     max_depth: int = 8,
 ) -> dict[str, Any] | None:
-    """
-    Return metadata with redaction and bounded scalar strings applied.
+    """Convert supported values while recursively applying key redaction.
 
-    Parameters
-    ----------
-    metadata : Mapping[str, Any] | None
-        Caller-supplied metadata.
-    redact_keys : tuple[str, ...], default DEFAULT_REDACT_KEYS
-        Case-insensitive key fragments whose values should be replaced with a
-        redaction marker. This is not an allowlist; all other keys are retained.
-    string_max_chars : int | None, default DEFAULT_METADATA_STRING_MAX_CHARS
-        Maximum length for string values. ``None`` disables string truncation.
-    max_depth : int, default 8
-        Maximum recursion depth for nested dictionaries and sequences.
-
-    Returns
-    -------
-    dict[str, Any] | None
-        Sanitized metadata, or ``None`` when no metadata is supplied.
+    Supported extensions to JSON are dates, decimals, paths, enums, dataclass
+    instances and tuples. Unknown objects, sets, and excessive depth become
+    fixed markers. Mapping keys must be strings. Key redaction is a heuristic,
+    so callers remain responsible for excluding secrets from free text.
     """
-    if not metadata:
+    if string_max_chars is not None and (
+        isinstance(string_max_chars, bool)
+        or not isinstance(string_max_chars, int)
+        or string_max_chars < 0
+    ):
+        raise ValueError("string_max_chars must be a nonnegative integer or None.")
+    if isinstance(max_depth, bool) or not isinstance(max_depth, int) or max_depth < 1:
+        raise ValueError("max_depth must be a positive integer.")
+    if not isinstance(redact_keys, tuple) or any(not isinstance(key, str) for key in redact_keys):
+        raise ValueError("redact_keys must be a tuple of strings.")
+    if metadata is None:
         return None
-    redaction_terms = tuple(term.lower() for term in redact_keys if term)
-    return {
-        str(key): _sanitize_value(
-            key=str(key),
-            value=value,
-            redact_keys=redaction_terms,
-            string_max_chars=string_max_chars,
-            depth=0,
-            max_depth=max_depth,
-        )
-        for key, value in metadata.items()
-    }
+    if not isinstance(metadata, Mapping):
+        raise TypeError("metadata must be a mapping with string keys.")
+    redaction_terms = tuple(key.lower() for key in redact_keys if key)
+
+    def normalize(value: Any, depth: int) -> Any:
+        if depth >= max_depth:
+            return DEPTH_LIMIT_VALUE
+        # Enums and dataclasses can introduce new dictionaries containing
+        # sensitive keys. Convert them before descending through the result.
+        if isinstance(value, Enum):
+            return normalize(value.value, depth + 1)
+        if is_dataclass(value) and not isinstance(value, type):
+            value = {item.name: getattr(value, item.name) for item in fields(value)}
+        if isinstance(value, Mapping):
+            result = {}
+            for key, child in value.items():
+                if not isinstance(key, str):
+                    raise TypeError("metadata keys must be strings.")
+                result[key] = (
+                    REDACTED_VALUE
+                    if any(term in key.lower() for term in redaction_terms)
+                    else normalize(child, depth + 1)
+                )
+            return result
+        if isinstance(value, list | tuple):
+            return [normalize(child, depth + 1) for child in value]
+        if isinstance(value, datetime | date):
+            value = value.isoformat()
+        elif isinstance(value, Decimal | Path):
+            value = str(value)
+        if isinstance(value, str):
+            return _truncate_string(value, string_max_chars)
+        if value is None or isinstance(value, bool | int):
+            return value
+        if isinstance(value, float):
+            return value if math.isfinite(value) else "[NONFINITE]"
+        return UNSUPPORTED_VALUE
+
+    return normalize(metadata, 0) or None
 
 
 def serialize_metadata(
@@ -118,168 +109,63 @@ def serialize_metadata(
     redact_keys: tuple[str, ...] = DEFAULT_REDACT_KEYS,
     string_max_chars: int | None = DEFAULT_METADATA_STRING_MAX_CHARS,
     max_bytes: int | None = DEFAULT_METADATA_MAX_BYTES,
+    max_depth: int = 8,
 ) -> str | None:
-    """
-    Serialize event metadata to deterministic JSON.
+    """Return deterministic sanitized JSON within the UTF-8 byte budget.
 
-    Parameters
-    ----------
-    metadata : Mapping[str, Any] | None
-        Caller-supplied metadata. ``None`` and empty mappings return ``None`` so
-        empty event metadata does not become noisy ``"{}"`` strings.
-    redact_keys : tuple[str, ...], default DEFAULT_REDACT_KEYS
-        Case-insensitive key fragments whose values should be redacted before
-        serialization.
-    string_max_chars : int | None, default DEFAULT_METADATA_STRING_MAX_CHARS
-        Maximum length for string values. ``None`` disables string truncation.
-    max_bytes : int | None, default DEFAULT_METADATA_MAX_BYTES
-        Maximum UTF-8 byte size for the serialized JSON. ``None`` disables the
-        final payload cap.
-
-    Returns
-    -------
-    str | None
-        Serialized JSON string, or ``None`` when no metadata is supplied.
+    Oversized payloads become a truncation summary, retaining a bounded preview
+    when space permits. Budgets too small for a marker return ``{}``; the
+    minimum supported budget is two bytes. Empty metadata returns ``None``.
     """
-    sanitized = sanitize_metadata(
-        metadata,
-        redact_keys=redact_keys,
-        string_max_chars=string_max_chars,
+    if max_bytes is not None and (
+        isinstance(max_bytes, bool) or not isinstance(max_bytes, int) or max_bytes < 2
+    ):
+        raise ValueError("max_bytes must be an integer of at least 2 or None.")
+    normalized = sanitize_metadata(
+        metadata, redact_keys=redact_keys, string_max_chars=string_max_chars, max_depth=max_depth,
     )
-    if not sanitized:
+    if normalized is None:
         return None
-    serialized = json.dumps(
-        sanitized,
-        default=json_default,
-        ensure_ascii=True,
-        sort_keys=True,
-        separators=(",", ":"),
-    )
+    serialized = _encode(normalized)
     if max_bytes is None or len(serialized.encode("utf-8")) <= max_bytes:
         return serialized
-    return _bounded_metadata_json(serialized, max_bytes=max_bytes)
+    summary = {"_truncated": True, "_original_size_bytes": len(serialized.encode("utf-8"))}
+    if len(_encode(summary).encode("utf-8")) > max_bytes:
+        marker = _encode({"_truncated": True})
+        return marker if len(marker.encode("utf-8")) <= max_bytes else "{}"
+    # Binary search the preview length because JSON escaping changes its size.
+    left, right = 0, len(serialized)
+    bounded = _encode(summary)
+    while left <= right:
+        middle = (left + right) // 2
+        candidate = _encode({**summary, "_preview": serialized[:middle]})
+        if len(candidate.encode("utf-8")) <= max_bytes:
+            bounded = candidate
+            left = middle + 1
+        else:
+            right = middle - 1
+    return bounded
 
 
 def deserialize_metadata(metadata_json: str | None) -> dict[str, Any]:
-    """
-    Deserialize metadata JSON into a dictionary.
-
-    Parameters
-    ----------
-    metadata_json : str | None
-        JSON string stored in an event record.
-
-    Returns
-    -------
-    dict[str, Any]
-        Parsed metadata dictionary. Empty input returns an empty dictionary.
-    """
-    if not metadata_json:
+    """Read the metadata object from an event; empty input returns ``{}``."""
+    if metadata_json is None:
         return {}
-    parsed = json.loads(metadata_json)
-    if isinstance(parsed, dict):
-        return parsed
-    return {"value": parsed}
+    result = json.loads(metadata_json)
+    if not isinstance(result, dict):
+        raise ValueError("metadata JSON must contain an object.")
+    return result
 
 
-def _sanitize_value(
-    *,
-    key: str,
-    value: Any,
-    redact_keys: tuple[str, ...],
-    string_max_chars: int | None,
-    depth: int,
-    max_depth: int,
-) -> Any:
-    """
-    Sanitize one metadata value while preserving JSON-friendly structure.
-    """
-    if _is_redacted_key(key, redact_keys):
-        return REDACTED_VALUE
-    if depth >= max_depth:
-        return _truncate_string(repr(value), string_max_chars)
-    if isinstance(value, str):
-        return _truncate_string(value, string_max_chars)
-    if isinstance(value, Mapping):
-        return {
-            str(child_key): _sanitize_value(
-                key=str(child_key),
-                value=child_value,
-                redact_keys=redact_keys,
-                string_max_chars=string_max_chars,
-                depth=depth + 1,
-                max_depth=max_depth,
-            )
-            for child_key, child_value in value.items()
-        }
-    if isinstance(value, list | tuple):
-        return [
-            _sanitize_value(
-                key=key,
-                value=child_value,
-                redact_keys=redact_keys,
-                string_max_chars=string_max_chars,
-                depth=depth + 1,
-                max_depth=max_depth,
-            )
-            for child_value in value
-        ]
-    if isinstance(value, set | frozenset):
-        return [
-            _sanitize_value(
-                key=key,
-                value=child_value,
-                redact_keys=redact_keys,
-                string_max_chars=string_max_chars,
-                depth=depth + 1,
-                max_depth=max_depth,
-            )
-            for child_value in sorted(value, key=repr)
-        ]
-    return value
-
-
-def _is_redacted_key(key: str, redact_keys: tuple[str, ...]) -> bool:
-    """
-    Return whether a metadata key should have its value redacted.
-    """
-    lowered_key = key.lower()
-    return any(term in lowered_key for term in redact_keys)
+def _encode(value: Any) -> str:
+    return json.dumps(
+        value, ensure_ascii=False, allow_nan=False, sort_keys=True, separators=(",", ":"),
+    )
 
 
 def _truncate_string(value: str, max_chars: int | None) -> str:
-    """
-    Truncate one string value when a maximum length is configured.
-    """
-    if max_chars is None or max_chars < 0 or len(value) <= max_chars:
+    if max_chars is None or len(value) <= max_chars:
         return value
-    return f"{value[:max_chars]}{TRUNCATED_MARKER}"
-
-
-def _bounded_metadata_json(serialized: str, *, max_bytes: int) -> str:
-    """
-    Return a deterministic small replacement payload for oversized metadata.
-    """
-    original_size = len(serialized.encode("utf-8"))
-    preview_budget = max(0, max_bytes - 120)
-    preview = serialized.encode("utf-8")[:preview_budget].decode("utf-8", errors="ignore")
-    payload = {
-        "_truncated": True,
-        "_original_size_bytes": original_size,
-        "_preview": f"{preview}{TRUNCATED_MARKER}",
-    }
-    bounded = json.dumps(
-        payload,
-        ensure_ascii=True,
-        sort_keys=True,
-        separators=(",", ":"),
-    )
-    while len(bounded.encode("utf-8")) > max_bytes and payload["_preview"]:
-        payload["_preview"] = payload["_preview"][:-1]
-        bounded = json.dumps(
-            payload,
-            ensure_ascii=True,
-            sort_keys=True,
-            separators=(",", ":"),
-        )
-    return bounded
+    if max_chars <= len(TRUNCATED_MARKER):
+        return TRUNCATED_MARKER[:max_chars]
+    return value[:max_chars - len(TRUNCATED_MARKER)] + TRUNCATED_MARKER
