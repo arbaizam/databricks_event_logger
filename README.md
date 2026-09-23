@@ -1,8 +1,8 @@
 # Databricks Event Logger
 
-Record what an operation did, how long it took, and whether it succeeded. Use the
-same small API in Python code and Databricks notebooks; choose console, memory,
-or an existing Delta table for delivery.
+Record what an operation did, how long it took, and whether it worked. The
+same small API works in Python code and in Databricks notebooks. Events can
+go to the console, to memory (for tests), or to an existing Delta table.
 
 ## Quickstart
 
@@ -13,7 +13,7 @@ python -m pip install .
 ```python
 from databricks_event_logger import EventLogger
 
-logger = EventLogger(app_name="positions")  # Prints JSON to the console.
+logger = EventLogger(app_name="positions")  # Prints each event as JSON.
 batch_logger = logger.bind(batch_id="close-2026-09-04")
 
 with batch_logger.event("positions.validate") as event:
@@ -24,15 +24,21 @@ with batch_logger.event("positions.validate") as event:
 batch_logger.record_event("positions.ready", row_count=len(positions))
 ```
 
-The scope emits one event when it exits. A normal exit records `success`; an
-exception records `failed` and propagates the original exception. Nested scopes
-and direct events on the same logger or its bound loggers inherit the active
-scope's ID as `parent_event_id` within the current execution context.
+A `with logger.event(...)` block is called a **scope**. It emits one event when
+it ends:
 
-## Enrich an operation as it runs
+- If the block finishes normally, the event's status is `success`.
+- If the block raises an exception, the status is `failed`, and the exception
+  is raised again exactly as it was.
 
-Set the result once the operation has produced it. Counting rows is always an
-explicit application operation; the logger never triggers a Spark count.
+Events recorded inside a scope get the scope's ID as their `parent_event_id`.
+This works for nested scopes and for bound loggers too, as long as they run in
+the same thread or async task.
+
+## Add results while an operation runs
+
+Set results on the scope as soon as you have them. The logger never counts
+rows by itself, so it never starts a Spark job you didn't ask for.
 
 ```python
 with logger.event("positions.check", metadata={"expected_min": 1}) as event:
@@ -43,20 +49,38 @@ with logger.event("positions.check", metadata={"expected_min": 1}) as event:
         event.metadata["reason"] = "No positions received"
 ```
 
-The editable fields are `metadata`, `row_count`, `status`, `severity`,
-`source_table`, and `target_table`. `event_id` is available during the block for
-correlating other records. An exception always produces a failed outcome.
-Use a fresh scope for each operation, entering and exiting it in the same
-execution context. A scope must not span a generator's `yield`.
+You can edit these fields: `metadata`, `row_count`, `status`, `severity`,
+`source_table`, and `target_table`. You can read `event.event_id` inside the
+block, for example to link other records to this operation. If the block
+raises an exception, the status is always `failed`, whatever you set.
 
-`logger.bind(**metadata)` returns a logger with additional business context. It
-shares the sink, correlation ID, and delivery health. Construction and binding
-validate the supplied metadata, including its keys. Top-level metadata changes
-are isolated; nested mutable values remain shared. Later nested mutations are
-checked when an event is serialized. Event metadata overrides bound values.
-Pass the same explicit `correlation_id` to separate tasks that belong to one
-workflow. An omitted correlation ID becomes a new UUID; it is independent of
-Databricks run identity.
+Rules for scopes:
+
+- Use a new scope for each operation.
+- Enter and exit a scope in the same thread or async task.
+- Never keep a scope open across a generator's `yield`. See
+  [Observe functions](#observe-functions) for what to do instead.
+
+### Shared metadata with `bind()`
+
+`logger.bind(**metadata)` returns a new logger that adds extra metadata to
+every event. The new logger shares the sink, the correlation ID, and the
+delivery health with the original.
+
+- The metadata is checked when you call `bind()` or create the logger. This
+  includes every key, even nested ones.
+- Adding or replacing top-level keys never changes the original logger.
+  Nested lists and dicts are still shared, though. If you change them later,
+  they're checked again when an event is written.
+- If an event's own metadata uses the same key as the bound metadata, the
+  event's value wins.
+
+### Correlation IDs
+
+A **correlation ID** groups the events of one workflow. If you don't pass
+one, each logger gets a new random UUID, which is unrelated to the Databricks
+run ID. To link separate tasks, pass the same `correlation_id` to each
+task's logger.
 
 ## Observe functions
 
@@ -71,11 +95,13 @@ async def fetch_record(client, record_id):
     return await client.fetch(record_id)
 ```
 
-Async decorators await the function before recording its outcome. You can also
-use an ordinary `with logger.event(...)` block inside an async function across
-`await` calls. Generator and async-generator decorators are rejected because
-their execution continues during iteration. Wrap the consumer's iteration
-instead, so the scope exits when the consumer finishes or stops early:
+For `async` functions, the event is recorded after the function has finished.
+You can also use a normal `with logger.event(...)` block inside an `async`
+function, including around `await` calls.
+
+Generator functions can't be decorated, because their code runs later, bit by
+bit, while the caller loops over them. Put the scope around the loop instead.
+The scope then ends when the loop finishes or stops early:
 
 ```python
 with logger.event("positions.read") as event:
@@ -85,14 +111,15 @@ with logger.event("positions.read") as event:
         event.row_count += 1
 ```
 
-Pass a logger to reusable application code, or wrap an imported callable with
-`logger.logged_event("event.name")(function)`. No ambient default logger is needed.
+To use a logger in reusable code, pass the logger in as an argument. To wrap
+a function you imported, call `logger.logged_event("event.name")(function)`.
+There is no global default logger.
 
 ## Observe work in threads
 
-A logger-bound decorator works in worker threads. Automatic parent tracking is
-context-local: thread-pool submissions do not propagate it. To preserve parent
-relationships, make a **fresh context copy for every submission**:
+A decorated function works in worker threads. But thread pools don't pass
+the current scope to the new thread by default. To keep the parent link,
+make a **new context copy for every task you submit**:
 
 ```python
 from concurrent.futures import ThreadPoolExecutor
@@ -113,26 +140,28 @@ with logger.event("tables.load"):
         results = [future.result() for future in futures]
 ```
 
-Without propagation, events are still delivered but have no automatic parent
-from the submitting thread. Do not share one copied context between concurrent
-submissions. For a single direct event, explicitly pass
-`logger.record_event("table.loaded", parent_event_id=parent_id)` instead.
+Without `copy_context()`, events are still delivered, but they have no
+parent. Never share one copied context between tasks that run at the same
+time. For a single event, you can set the parent yourself instead:
+`logger.record_event("table.loaded", parent_event_id=parent_id)`.
 
 ## Use Delta in Databricks
 
-Provision the event table once, using SQL generated from the package's storage
-schema:
+### 1. Create the table once
+
+The package generates the table SQL for you:
 
 ```python
 from databricks_event_logger import create_table_sql
 
 ddl = create_table_sql("main.observability.event_log")
-print(ddl)  # Review or put this SQL in your deployment process.
-# spark.sql(ddl) executes the creation when you choose to provision it.
+print(ddl)  # Review it, or add it to your deployment process.
+# spark.sql(ddl) creates the table when you choose to.
 ```
 
-The catalog and schema must already exist. At task startup, choose the existing
-table and supply runtime identity:
+The catalog and schema must already exist.
+
+### 2. Set up the logger when the task starts
 
 ```python
 from databricks_event_logger import DeltaSink, EventLogger
@@ -162,9 +191,9 @@ logger = EventLogger(
 )
 ```
 
-Configure these notebook task parameters in the job configuration. Databricks
-substitutes them before the task starts; the expressions do not belong in Python
-code. See [Databricks dynamic value references](https://docs.databricks.com/aws/en/jobs/dynamic-value-references).
+Add these notebook task parameters in the **job configuration**, not in Python
+code. Databricks fills in the values before the task starts. See
+[Databricks dynamic value references](https://docs.databricks.com/aws/en/jobs/dynamic-value-references).
 
 | Parameter | Job configuration value |
 | --- | --- |
@@ -175,76 +204,119 @@ code. See [Databricks dynamic value references](https://docs.databricks.com/aws/
 | `workspace_id` | `{{workspace.id}}` |
 | `workspace_url` | `{{workspace.url}}` |
 
-The resolver makes one best-effort attempt to read notebook context JSON, then
-applies explicit canonical field values. Unknown explicit fields are errors;
-missing discovered fields stay empty. It does not inspect Spark configuration or
-environment variables. Use explicit task parameters when notebook discovery is
-unavailable. Navigation URLs are available as `context.job_url` and
-`context.job_run_url`.
+`resolve_context` works in two steps:
 
-Write ordinary Spark code inside a scope:
+1. It tries once to read the notebook's context JSON. Whatever it can't
+   find stays empty.
+2. It applies the values you pass in. Your values always win.
+
+It doesn't read Spark settings or environment variables. An unknown field
+name raises an error, so typos are caught. If notebook discovery is blocked
+on your compute, pass the task parameters above. For links to the job and the
+run, use `context.job_url` and `context.job_run_url`.
+
+### 3. Wrap your Spark code in scopes
 
 ```python
 with logger.event("positions.publish", target_table=target_table):
     output.write.format("delta").mode("append").saveAsTable(target_table)
 ```
 
-Spark transformations are lazy: a scope around `spark.table(...)` measures plan
-construction. Put the scope around the write, count, or other action whose
-execution you want to observe.
+Spark transformations are lazy: `spark.table(...)` only builds a plan, and
+the real work happens later. So put the scope around the **action** you want
+to measure, such as a write or a count.
 
-Delta delivery is immediate and synchronous, with one insert per event. The sink
-never creates its target table automatically. `validate()` checks column names,
-types, and nullability compatibility; it does not establish insert permission,
-table constraints, or the storage provider.
+### How Delta delivery works
 
-## Delivery and failure behavior
+- Each event is written right away, with one insert per event. The logger
+  waits for the insert to finish.
+- The sink never creates the table.
+- `validate()` checks column names, types, and whether columns allow nulls.
+  It doesn't check insert permission, table constraints, or the storage
+  format.
 
-`logger.health` is an immutable snapshot with `attempted`, `succeeded`, `failed`,
-and `last_error` fields. The last error remains available after later successes.
-`record_event()` returns the emitted `EventRecord`, or `None` after a tolerated
-preparation or delivery failure.
+## When logging fails
 
-With the default `strict_logging=False`, ordinary preparation and delivery
-errors are recorded in health and do not fail business work. Invalid logger
-configuration, static event fields, or non-mapping metadata raise before work
-starts. Per-event metadata content and editable scope fields are checked at
-delivery; invalid content or edits follow the preparation-failure policy.
-With `strict_logging=True`, a logging failure after successful business work
-raises. In nested scopes it aborts the enclosing operation, which therefore
-records a failed outcome too. An exception already raised by business code is
-always preserved.
+### Delivery health
 
-Metadata is bounded JSON with sensitive-key redaction. Dataclasses, namedtuples,
-and named Spark `Row` values retain field names for recursive redaction. Integral
-and real numeric scalars, including NumPy numbers, normalize without requiring
-NumPy as a runtime dependency. Counts must be nonnegative 64-bit integers;
-metrics must be finite numbers. Booleans are not counts or metrics; NumPy boolean
-metadata values use the unsupported-value marker. JSON escapes non-ASCII text,
-including lone surrogates, so the encoded metadata is safe to transmit as UTF-8.
+`logger.health` shows how delivery is going:
 
-Exception messages are bounded free text, so avoid putting secrets in exception
-messages. For useful failure locations, enable `capture_error_frames=True` when constructing the
-logger. This stores up to 20 selected frames with file basename, function, and
-line number in `error_frames_json`; it captures neither source text nor local
-variables. `stack_trace_hash` groups the exception type and frame locations.
+| Field | Meaning |
+| --- | --- |
+| `attempted` | Events the logger tried to deliver. |
+| `succeeded` | Events the sink accepted. |
+| `failed` | Events that couldn't be built or delivered. |
+| `last_error` | The most recent failure. It stays set after later successes. |
 
-`event_date` is always derived from the UTC event timestamp. In a non-UTC query
-session, `to_date(event_ts)` can differ near midnight. Use UTC date boundaries
-for partition filters; the logger never changes the application's Spark timezone.
+`record_event()` returns the `EventRecord` it delivered, or `None` if delivery
+failed and the failure was tolerated.
 
-## Examples and development
+### The failure rules
+
+Logging should never break your job.
+
+- **Setup mistakes fail right away.** Invalid logger settings, invalid event
+  fields, and metadata that isn't a dict all raise before your work starts.
+- **Delivery problems are tolerated by default.** Some problems can only be
+  checked when the event is written: a bad metadata value, an invalid value
+  set on a scope, or a sink error. With the default `strict_logging=False`,
+  these are counted in `health` and a warning is issued. Your code keeps
+  running.
+- **Strict mode raises them.** With `strict_logging=True`, a logging failure
+  raises after your work succeeds. In nested scopes, this stops the outer
+  operation too, so the outer event is recorded as `failed`.
+- **Your exception always wins.** If your code already raised an exception,
+  that exception is the one you get, whatever happens during logging.
+
+### What metadata can contain
+
+Metadata is stored as JSON, with a size limit.
+
+- Keys that look sensitive, such as `password`, `token`, or `secret`, have
+  their values replaced with `[REDACTED]`. Fields of dataclasses, named
+  tuples, and Spark `Row` objects are checked the same way.
+- Dates, decimals, paths, enums, and NumPy numbers are converted
+  automatically. NumPy isn't required to install the package.
+- A NumPy boolean in metadata is stored as `[UNSUPPORTED]`.
+- Non-ASCII text is escaped, including broken characters (lone surrogates),
+  so the JSON is always valid UTF-8.
+
+Counts must be whole numbers from 0 up to the 64-bit integer limit. Metrics
+must be finite numbers. `True` and `False` are not accepted for either.
+
+### Error details
+
+- Exception messages are stored as shortened free text. Don't put secrets in
+  exception messages.
+- To see where failures happen, create the logger with
+  `capture_error_frames=True`. This stores up to 20 frames in
+  `error_frames_json`, each with the file name, function name, and line
+  number. Source code and local variables are never stored.
+- `stack_trace_hash` is a fingerprint of the exception type and those
+  locations. Failures from the same place share the same hash.
+
+### Dates and time zones
+
+`event_date` is always the UTC date of `event_ts`. If your query session uses
+another time zone, `to_date(event_ts)` can show a different date near
+midnight. Filter partitions using UTC dates. The logger never changes your
+Spark session's time zone.
+
+## Examples and documentation
 
 - [Local developer notebook](notebooks/databricks_event_logger_developer_guide.py):
-  editable scopes, nested events, decorators, memory sink, and delivery health.
-- [Production notebook](notebooks/golden_path_notebook.py): explicit job context,
-  native Spark write, and validation of the current date's output.
-- [Event queries](docs/event_queries.sql): a correlation timeline, recent failures,
-  and duration summaries.
-- [API and architecture](docs/databricks-event-logger-design-spec.md): the compact
-  implementation contract.
-- [Databricks validation](docs/databricks_validation.md): live test instructions
-  and a disposable-table delivery-cost measurement.
+  scopes, nested events, decorators, the memory sink, and delivery health.
+- [Production notebook](notebooks/golden_path_notebook.py): job context, a
+  Spark write, and a check of today's output.
+- [Event queries](docs/event_queries.sql): a workflow timeline, recent
+  failures, and duration summaries.
+- [API and architecture](docs/databricks-event-logger-design-spec.md): how
+  the package works inside, and which module does what.
+- [Contributing](CONTRIBUTING.md): how to set up, test, and extend the code.
+- [Databricks validation](docs/databricks_validation.md): how to run the live
+  tests and measure how long delivery takes.
+
+## Development
 
 ```bash
 python -m pip install -e ".[dev]"
@@ -253,10 +325,10 @@ python -m ruff check .
 python -m build --wheel
 ```
 
-The development dependencies include NumPy for scalar interoperability tests;
-the installed package has no runtime dependencies. Install `.[dev,spark-test]`
-to include local PySpark schema tests. Live integration tests require an active
-Databricks Spark session and an explicitly chosen test
-schema; follow the [validation guide](docs/databricks_validation.md). Local tests
-do not establish Unity Catalog permissions, Delta transaction behavior, or
-serverless compatibility.
+- The installed package has no runtime dependencies. The development extras
+  include NumPy, for testing NumPy number handling.
+- Install `.[dev,spark-test]` to also run the local PySpark schema tests.
+- Live integration tests need an active Databricks Spark session and a test
+  schema that you choose. Follow the [validation guide](docs/databricks_validation.md).
+- Local tests can't check Unity Catalog permissions, Delta transactions, or
+  serverless compatibility.

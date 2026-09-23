@@ -78,8 +78,8 @@ Review against each objective separately:
   `_Sanitizer` class.
 - The delivery path was split into `_deliver`, `_finish_record`, and
   `_should_raise`.
-- Docstrings were rewritten in Google style. The architecture doc was
-  rewritten, and a new `CONTRIBUTING.md` was added.
+- Docstrings were rewritten in Google style. The README and the
+  architecture doc were rewritten, and a new `CONTRIBUTING.md` was added.
 - The tests only changed their import paths. No assertions were changed.
 
 The author says they ran these checks: 178 unit tests pass (with PySpark),
@@ -109,9 +109,10 @@ compared the baseline and the refactor on about 6,000 randomized
 4. **Error precedence changed.** When several timestamp fields are invalid
    at once, `EventRecord` may now report a different field first, because
    the checks run in a different order.
-5. **The README wasn't simplified.** That work was interrupted, so the
-   README still has the original dense wording. Judge whether it meets the
-   "simple terms" objective.
+5. **The README was rewritten in simpler terms.** It keeps the original
+   facts and code samples but now uses headings, bullet lists, and a health
+   table. Check that no fact was lost or changed in the rewrite: diff it
+   against the README at `77f33cf`, one paragraph at a time.
 6. **Live Databricks integration tests weren't run.** The 6 tests in
    `tests/integration/` skipped because no Databricks workspace was available.
 7. **Warning `stacklevel`s now go through `warn_safely`**, which adds 1.
@@ -143,8 +144,8 @@ compared the baseline and the refactor on about 6,000 randomized
   discovered values (baseline behavior), that explicit `None` still
   overrides, and that unknown explicit keys still raise.
 - **Documentation accuracy:** check every claim in the docstrings,
-  `docs/databricks-event-logger-design-spec.md`, and `CONTRIBUTING.md`
-  against the code. For example, check the claim that the modules below
+  `README.md`, `docs/databricks-event-logger-design-spec.md`, and
+  `CONTRIBUTING.md` against the code. For example, check the claim that the modules below
   `logger.py` never import it.
 
 ## How to report
