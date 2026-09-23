@@ -21,28 +21,28 @@ with ``strict_logging=True`` the error is raised, and interrupts such as
 ``KeyboardInterrupt`` are always raised. Even then, if the application's own
 code already raised an exception, that original exception wins.
 
-**Parent tracking:** while an ``event(...)`` block is open, any event
-recorded inside it gets the block's ``event_id`` as its ``parent_event_id``.
-This uses a ``ContextVar``, so it works correctly with threads and
-``asyncio``.
+**Parent tracking:** events on this logger or its bindings inherit the active
+scope ID unless an explicit parent is supplied. Async tasks inherit context;
+thread-pool submissions need a fresh ``copy_context()`` to inherit it.
 """
 
 from __future__ import annotations
 
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import AbstractContextManager, contextmanager
-from contextvars import ContextVar
 from copy import copy
 from dataclasses import replace
 from datetime import datetime
 from typing import Any, TypeVar
 from uuid import uuid4
 
+from databricks_event_logger._state import _LoggerState
+from databricks_event_logger._trace_compat import _legacy_delivery, _legacy_scope
 from databricks_event_logger.context import RuntimeContext
 from databricks_event_logger.decorators import wrap_in_scope
 from databricks_event_logger.diagnostics import warn_safely
 from databricks_event_logger.failures import describe_exception
-from databricks_event_logger.health import DeliveryHealth, DeliveryTracker
+from databricks_event_logger.health import DeliveryHealth
 from databricks_event_logger.metadata import (
     DEFAULT_METADATA_MAX_BYTES,
     DEFAULT_METADATA_STRING_MAX_CHARS,
@@ -83,18 +83,27 @@ class EventLogger:
         context: Where the code runs (job, task, workspace). Defaults to empty.
         correlation_id: Groups related events. Defaults to a new UUID. Pass
             the same value to several tasks to link them together.
-        default_metadata: Metadata added to every event. Per-event metadata
-            wins when the same key appears in both.
-        metadata_max_bytes: The maximum size of ``metadata_json``, in bytes.
-        metadata_string_max_chars: The maximum length of each metadata string.
-        error_message_max_chars: The maximum length of ``error_message``.
-        redact_keys: Hide metadata values whose key contains any of these words.
-        strict_logging: If ``True``, raise logging failures instead of warning.
+        default_metadata: A mapping added to every event, copied at the top
+            level. Per-event values override matching keys. Traversed keys
+            must be strings; redacted and depth-limited values are not visited.
+        metadata_max_bytes: JSON byte limit, at least 2; default 4000.
+            ``None`` disables the limit.
+        metadata_string_max_chars: Input string limit, at least 0; default
+            2000. ``None`` disables it. Generated redaction/depth markers
+            are not shortened by this setting.
+        error_message_max_chars: Error text limit, at least 0; default 2000.
+            ``None`` disables it. Truncation markers count toward the limit.
+        redact_keys: Tuple of substrings to hide in metadata keys, ignoring
+            case. Empty terms are ignored; see ``metadata.DEFAULT_REDACT_KEYS``.
+        strict_logging: Raise ordinary delivery errors after successful work
+            if true. Interrupts propagate in either mode. An existing business
+            exception takes precedence over every delivery error.
         capture_error_frames: If ``True``, store the file, function, and line
             of each failure in ``error_frames_json``.
 
     Raises:
-        TypeError: If ``sink`` has no ``emit`` method, or metadata isn't a mapping.
+        TypeError: If ``sink.emit`` is not callable, metadata isn't a mapping,
+            or a traversed metadata key isn't a string.
         ValueError: If a setting or identity value is invalid.
     """
 
@@ -147,8 +156,7 @@ class EventLogger:
         self.capture_error_frames = capture_error_frames
 
         # State shared with every logger created by bind().
-        self._health = DeliveryTracker()
-        self._active_event_id: ContextVar[str | None] = ContextVar("event_parent", default=None)
+        self._state = _LoggerState()
 
         # Check the identity fields above using the same rules as events.
         self._new_record("logger.configuration")
@@ -160,7 +168,7 @@ class EventLogger:
     @property
     def health(self) -> DeliveryHealth:
         """Delivery counts for this logger and its bound loggers. See ``DeliveryHealth``."""
-        return self._health.snapshot()
+        return self._state.health.snapshot()
 
     @property
     def default_metadata(self) -> dict[str, Any]:
@@ -178,20 +186,30 @@ class EventLogger:
     def bind(self, **metadata: Any) -> EventLogger:
         """Return a new logger that adds ``metadata`` to every event.
 
-        The new logger shares this logger's sink, identity, correlation ID,
-        delivery health, and parent tracking. Only its default metadata is
-        different. The original logger is not changed.
+        The new logger copies the current configuration and shares the sink,
+        runtime context, delivery health, and parent tracking. Reassigning a
+        configuration attribute later affects that instance only. Nested
+        metadata values and any subclass attributes retain shallow-copy
+        behavior. The original logger's top-level metadata is not changed.
+
+        Args:
+            **metadata: Default metadata keys to add or replace.
+
+        Returns:
+            A logger of the same class with the merged default metadata.
 
         Example::
 
             batch_logger = logger.bind(batch_id="2026-09-04")
 
         Raises:
-            TypeError: If a metadata key (including a nested key) isn't a string.
+            TypeError: If a traversed metadata key isn't a string.
+            ValueError: If a serialization setting has become invalid.
         """
         merged = {**self._default_metadata, **metadata}
         self._serialize_metadata(merged)  # Raises if the merged metadata is invalid.
-        # A shallow copy shares _health and _active_event_id with this logger.
+        # Preserve shallow-copy behavior (including subclasses). _state contains
+        # the package-owned mutable state that bindings intentionally share.
         child = copy(self)
         child._default_metadata = merged
         return child
@@ -221,16 +239,34 @@ class EventLogger:
     ) -> EventRecord | None:
         """Record something that has already happened, and deliver it now.
 
-        ``parent_event_id`` defaults to the innermost open ``event(...)``
-        block. Other arguments match the ``EventRecord`` fields.
+        Args:
+            event_name: Nonempty name, at most 255 characters.
+            event_type: Nonempty category, at most 100 characters.
+            status: An ``EventStatus`` value or its string; default success.
+            severity: An ``EventSeverity`` value, its string, or ``None``.
+            metadata: Per-event mapping merged over defaults. Contents are
+                checked at delivery, not during fixed-field validation.
+            event_id: Nonempty ID, or ``None`` to generate a UUID.
+            parent_event_id: Explicit parent ID; ``None`` inherits the active scope.
+            source_table: Optional source table text.
+            target_table: Optional target table text.
+            row_count: Optional integer from 0 through 2**63 - 1, excluding bool.
+            metric_name: Optional metric label.
+            metric_value: Optional finite real number, excluding bool.
+            start_ts: Optional timezone-aware start time, converted to UTC.
+            end_ts: Optional timezone-aware end time, converted to UTC.
+            duration_ms: Optional integer milliseconds, with the same range as row_count.
 
         Returns:
             The delivered ``EventRecord``, or ``None`` if delivery failed
-            and ``strict_logging`` is off.
+            with an ordinary error and ``strict_logging`` is off.
 
         Raises:
-            TypeError, ValueError: If an argument is invalid. Nothing is
-                delivered, and health isn't counted.
+            TypeError: Non-mapping metadata, before delivery is attempted.
+            ValueError: Invalid fixed fields, before delivery is attempted.
+            Exception: In strict mode, metadata-content or sink errors propagate
+                after attempted/failed health is counted. In default mode they warn.
+            BaseException: Delivery interrupts such as KeyboardInterrupt or SystemExit.
         """
         check_is_mapping(metadata)
         event = self._new_record(
@@ -240,7 +276,8 @@ class EventLogger:
             severity=severity,
             event_id=event_id if event_id is not None else str(uuid4()),
             parent_event_id=(
-                parent_event_id if parent_event_id is not None else self._active_event_id.get()
+                parent_event_id
+                if parent_event_id is not None else self._state.active_event_id.get()
             ),
             source_table=source_table,
             target_table=target_table,
@@ -273,6 +310,11 @@ class EventLogger:
 
         Returns:
             The same as ``record_event``.
+
+        Raises:
+            TypeError, ValueError: Invalid fixed fields or non-mapping metadata.
+            Exception: Delivery errors in strict mode, as in ``record_event``.
+            BaseException: Delivery interrupts, as in ``record_event``.
         """
         return self.record_event(
             event_name if event_name is not None else f"metric.{metric_name}",
@@ -303,7 +345,22 @@ class EventLogger:
         - Exception: the event has status ``"failed"`` and error details, and
           the original exception propagates unchanged.
 
-        Events recorded inside the block get this event as their parent.
+        Events on this logger or its bindings inherit this parent within the
+        execution context. Explicit parents on direct events override it.
+
+        Args:
+            event_name: Nonempty name, at most 255 characters.
+            event_type: Nonempty category, at most 100 characters.
+            metadata: Per-event mapping. Only its top level is copied now;
+                nested values are shared and contents are checked on exit.
+            status: Initial outcome; an EventStatus value or its string.
+            severity: Initial EventSeverity value, its string, or ``None``.
+            source_table: Initial optional source table text.
+            target_table: Initial optional target table text.
+            row_count: Initial optional count; see ``EventRecord`` for its range.
+
+        Returns:
+            A single-use context manager yielding an editable ``EventScope``.
 
         Example::
 
@@ -319,28 +376,25 @@ class EventLogger:
               block around the loop that consumes the generator instead.
 
         Raises:
-            TypeError, ValueError: Right away, before the block runs, if an
-                argument is invalid.
+            TypeError, ValueError: Invalid fixed fields or non-mapping metadata,
+                before the block runs. Metadata contents and scope edits are
+                checked only on exit and count as delivery attempts.
+            Exception: A delivery failure in strict mode after successful work.
+            BaseException: The original business exception, or a delivery
+                interrupt after successful work. See the module's failure rule.
         """
         # Build the record now, so invalid arguments fail before the block runs.
-        template = self._new_record(
-            event_name,
-            event_type=event_type,
-            status=status,
-            severity=severity,
-            source_table=source_table,
-            target_table=target_table,
-            row_count=row_count,
+        # These values initialize both validation and the editable scope.
+        results = dict(
+            row_count=row_count, status=status, severity=severity,
+            source_table=source_table, target_table=target_table,
         )
+        template = self._new_record(event_name, event_type=event_type, **results)
         scope = EventScope(
-            _template=template,
-            # A snapshot, so the caller's later changes to their dict don't leak in.
+            _event=template,
+            # Only the top level is copied; nested values remain shared.
             metadata=copy_metadata(metadata),
-            row_count=row_count,
-            status=status,
-            severity=severity,
-            source_table=source_table,
-            target_table=target_table,
+            **results,
         )
         return self._run_scope(scope)
 
@@ -354,7 +408,18 @@ class EventLogger:
         """Return a decorator that records one event for every call of a function.
 
         Works on both normal and ``async`` functions. The return value and
-        any exception pass through unchanged.
+        business exception pass through unchanged, subject to delivery errors
+        after successful work as described by ``event``.
+
+        Args:
+            event_name: Nonempty name, at most 255 characters.
+            event_type: Nonempty category, at most 100 characters; default function.
+            metadata: Per-call metadata. The top level is copied when the
+                decorator is created and again for each call; nested objects
+                remain shared. Contents are checked when each call finishes.
+
+        Returns:
+            A decorator preserving the function's name, docstring and signature.
 
         Example::
 
@@ -363,15 +428,18 @@ class EventLogger:
                 return sum(row["amount"] for row in rows)
 
         Raises:
-            TypeError, ValueError: Right away if an argument is invalid.
-            TypeError: When decorating a generator function. See ``event()``.
+            TypeError, ValueError: Invalid fixed fields or non-mapping metadata
+                at creation, or a generator/async-generator function at decoration.
+            Exception: On a wrapped call, strict delivery failures after success.
+            BaseException: On a wrapped call, the business exception or a
+                delivery interrupt, following ``event``'s failure rules.
         """
         # Check the arguments now, before the decorated function can ever run.
         self._new_record(event_name, event_type=event_type)
         snapshot = copy_metadata(metadata)
 
         def decorate(func: F) -> F:
-            # event() copies the snapshot on each call, so calls don't share edits.
+            # Each call gets independent top-level keys; nested values stay shared.
             return wrap_in_scope(
                 func, lambda: self.event(event_name, event_type=event_type, metadata=snapshot)
             )
@@ -388,8 +456,20 @@ class EventLogger:
     ) -> T:
         """Call ``func(*args, **kwargs)`` and record it as an event with type ``"task"``.
 
-        Returns whatever ``func`` returns. For an ``async`` function this is a
-        coroutine, so ``await`` it.
+        Args:
+            event_name: Name for the task event; same constraints as ``event``.
+            func: Normal or async callable; generator functions are rejected.
+            *args: Positional arguments passed unchanged to func.
+            metadata: Event metadata, not forwarded as a function argument.
+            **kwargs: Keyword arguments passed unchanged to func.
+
+        Returns:
+            The function's result, or a coroutine to await for an async function.
+
+        Raises:
+            TypeError, ValueError: Setup errors described by ``logged_event``.
+            BaseException: Function exceptions or delivery exceptions under
+                ``event``'s failure rules. Async errors occur when awaited.
         """
         decorator = self.logged_event(event_name, event_type="task", metadata=metadata)
         return decorator(func)(*args, **kwargs)
@@ -399,14 +479,15 @@ class EventLogger:
     # ------------------------------------------------------------------
 
     @contextmanager
+    @_legacy_scope
     def _run_scope(self, scope: EventScope) -> Iterator[EventScope]:
         """Run one ``event(...)`` block: track the parent, time it, and deliver on exit."""
         event = replace(
-            scope._template, parent_event_id=self._active_event_id.get(), start_ts=utc_now()
+            scope._event, parent_event_id=self._state.active_event_id.get(), start_ts=utc_now()
         )
         started_ms = monotonic_ms()
         # Make this scope the parent of anything recorded inside the block.
-        token = self._active_event_id.set(event.event_id)
+        token = self._state.active_event_id.set(event.event_id)
         business_error: BaseException | None = None
         try:
             yield scope
@@ -415,7 +496,7 @@ class EventLogger:
             raise
         finally:
             # Restore the outer parent first, so it's correct even if delivery raises.
-            self._active_event_id.reset(token)
+            self._state.active_event_id.reset(token)
             ended_at = utc_now()
             self._deliver(
                 event,
@@ -441,6 +522,7 @@ class EventLogger:
             **fields,
         )
 
+    @_legacy_delivery
     def _deliver(
         self,
         event: EventRecord,
@@ -461,12 +543,12 @@ class EventLogger:
         Returns:
             The delivered record, or ``None`` if delivery failed without raising.
         """
-        self._health.record_attempt()
+        self._state.health.record_attempt()
         try:
             final_event = self._finish_record(event, metadata, updates, business_error)
             self.sink.emit(final_event)
         except BaseException as delivery_error:
-            self._health.record_failure(delivery_error)
+            self._state.health.record_failure(delivery_error)
             if self._should_raise(delivery_error, business_error):
                 raise
             # stacklevel=2 points the warning at the code that called _deliver.
@@ -475,7 +557,7 @@ class EventLogger:
                 stacklevel=2,
             )
             return None
-        self._health.record_success()
+        self._state.health.record_success()
         return final_event
 
     def _finish_record(

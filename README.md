@@ -27,7 +27,7 @@ batch_logger.record_event("positions.ready", row_count=len(positions))
 A `with logger.event(...)` block is called a **scope**. It emits one event when
 it ends:
 
-- If the block finishes normally, the event's status is `success`.
+- If the block finishes normally, it keeps the status you set (default `success`).
 - If the block raises an exception, the status is `failed`, and the exception
   is raised again exactly as it was.
 
@@ -67,8 +67,9 @@ Rules for scopes:
 every event. The new logger shares the sink, the correlation ID, and the
 delivery health with the original.
 
-- The metadata is checked when you call `bind()` or create the logger. This
-  includes every key, even nested ones.
+- Metadata is checked when you call `bind()` or create the logger. Traversed
+  keys must be strings. Redacted values and branches beyond the depth limit
+  are not traversed, so their nested keys are not checked.
 - Adding or replacing top-level keys never changes the original logger.
   Nested lists and dicts are still shared, though. If you change them later,
   they're checked again when an event is written.
@@ -239,7 +240,8 @@ to measure, such as a write or a count.
 
 ### Delivery health
 
-`logger.health` shows how delivery is going:
+`logger.health` is an immutable snapshot of delivery counts shared by a
+logger and its bindings. Read it again to see later updates:
 
 | Field | Meaning |
 | --- | --- |
@@ -256,12 +258,15 @@ failed and the failure was tolerated.
 Logging should never break your job.
 
 - **Setup mistakes fail right away.** Invalid logger settings, invalid event
-  fields, and metadata that isn't a dict all raise before your work starts.
+  fields, and metadata that isn't a mapping all raise before your work starts.
+  Mappings include `dict` and `collections.UserDict`.
 - **Delivery problems are tolerated by default.** Some problems can only be
   checked when the event is written: a bad metadata value, an invalid value
-  set on a scope, or a sink error. With the default `strict_logging=False`,
+  set on a scope, or an ordinary sink exception. With `strict_logging=False`,
   these are counted in `health` and a warning is issued. Your code keeps
   running.
+- **Interrupts propagate.** After successful work, `KeyboardInterrupt`,
+  `SystemExit`, and similar delivery interrupts propagate in either mode.
 - **Strict mode raises them.** With `strict_logging=True`, a logging failure
   raises after your work succeeds. In nested scopes, this stops the outer
   operation too, so the outer event is recorded as `failed`.
@@ -292,8 +297,11 @@ must be finite numbers. `True` and `False` are not accepted for either.
   `capture_error_frames=True`. This stores up to 20 frames in
   `error_frames_json`, each with the file name, function name, and line
   number. Source code and local variables are never stored.
-- `stack_trace_hash` is a fingerprint of the exception type and those
-  locations. Failures from the same place share the same hash.
+- `stack_trace_hash` groups the exception type and captured locations, ignoring
+  the message. The same captured stack has the same hash. Scope/decorator
+  frames retain the SDK's legacy storage labels so moving those functions
+  does not split existing application-failure groups. Application frames
+  use actual locations; moving application code can change the hash.
 
 ### Dates and time zones
 

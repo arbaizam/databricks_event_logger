@@ -9,7 +9,11 @@ from __future__ import annotations
 
 
 class EventLoggerError(Exception):
-    """Base class for all exceptions raised by this package."""
+    """Base class for package-specific exceptions.
+
+    Field and metadata validation also use built-in ValueError and TypeError;
+    those are not subclasses of this class. Sink exceptions are not wrapped.
+    """
 
 
 class EventLoggerConfigurationError(EventLoggerError):

@@ -23,6 +23,13 @@ class ConsoleSink:
     stream: TextIO | None = None
 
     def emit(self, event: EventRecord) -> None:
-        """Print ``event`` as one JSON line with sorted keys."""
+        """Print one JSON line with sorted keys; return None.
+
+        Args:
+            event: Record whose dates/timestamps are converted to ISO strings.
+
+        Raises:
+            Exception: Serialization or stream-write errors propagate to the logger.
+        """
         target = self.stream or sys.stdout
         print(json.dumps(event.as_json_dict(), sort_keys=True), file=target)

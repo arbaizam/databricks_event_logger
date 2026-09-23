@@ -1,8 +1,9 @@
 """Helpers for reporting problems without causing new ones.
 
 The logger often runs while the application is already handling an error.
-These helpers turn values into short text and emit warnings in a way that can
-never raise, so a logging problem can't replace the application's own error.
+safe_text tolerates a failing __str__; callers supply a valid text limit.
+warn_safely suppresses failures from warning filters and handlers. Text
+truncation requires a string and a nonnegative integer limit (or None).
 """
 
 from __future__ import annotations
@@ -17,11 +18,13 @@ def truncate_text(text: str, max_chars: int | None) -> str:
     """Shorten text to at most ``max_chars`` characters.
 
     When text is cut, it ends with ``TRUNCATED_MARKER`` so readers can tell.
-    The marker counts toward the limit.
+    The marker counts toward the limit. If the limit is shorter than the
+    marker, only its prefix fits; a zero limit returns an empty string.
 
     Args:
         text: The text to shorten.
-        max_chars: The maximum length, or ``None`` for no limit.
+        max_chars: Nonnegative integer length, or ``None`` for no limit.
+            This low-level helper assumes the caller has validated it.
 
     Returns:
         The original text if it fits, otherwise a shortened copy.
@@ -40,11 +43,12 @@ def safe_text(value: object, *, max_chars: int | None = 2000) -> str:
     used for metadata (metadata has its own rules in ``metadata.py``).
 
     It calls ``str(value)`` but never ``repr(value)``. If ``str`` raises
-    anything, even ``KeyboardInterrupt``, it returns ``UNPRINTABLE_VALUE``.
+    anything, even ``KeyboardInterrupt``, it uses ``UNPRINTABLE_VALUE`` before
+    applying the same length limit (which may shorten that marker).
 
     Args:
         value: The value to describe.
-        max_chars: The maximum length, or ``None`` for no limit.
+        max_chars: Validated nonnegative integer length, or ``None`` for no limit.
 
     Returns:
         Text that is at most ``max_chars`` characters long.

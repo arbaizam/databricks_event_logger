@@ -1,0 +1,77 @@
+{
+  "revision": "77f33cfaa720398f54dcf2218569531d10d1a16f",
+  "areas": {
+    "context": {
+      "count": 130,
+      "sha256": "011f6cfd59589c32298e51ab2b712c70341c03d85c0e51d8f2d2c0cc8568c7cf"
+    },
+    "ddl": {
+      "count": 1,
+      "sha256": "da9d465cec23e47af7f37c95acacf7aaf446d454b987022b45ca630b6c56e41e"
+    },
+    "delta": {
+      "count": 30,
+      "sha256": "83ceb1819602b6fac96fea22153baf920218b61f1dac16226f12c1ba140c9b32"
+    },
+    "direct-warning": {
+      "count": 1,
+      "sha256": "91f9be1179fcb269d9fd57d58521a478ea0fcbdf3e588f794669f28c5d008375"
+    },
+    "discovery": {
+      "count": 40,
+      "sha256": "ee51ff1aa57428da215186ee3ad5f51ce083f90cb5ff53698af62562fc5dd5da"
+    },
+    "doc": {
+      "count": 7,
+      "sha256": "ad9b4266c6ccfe9be1759cbdd7543dfdc8cc4607ff0c8819fc9f8f4c28de3f2b"
+    },
+    "error-fields": {
+      "count": 4,
+      "sha256": "f68e25f434d0c287bb62a10d54f8f7d26abc0632de8d5704aa48957318cad247"
+    },
+    "exports": {
+      "count": 1,
+      "sha256": "b66ad9d5ec222137dfde0fa924698f46141e06f21ab047dae424a3dfa38b8fc7"
+    },
+    "failure": {
+      "count": 150,
+      "sha256": "193eda51bebf4923b396e8f72c807c09f3146a45ced8f9a6843aa4a879c75c19"
+    },
+    "import": {
+      "count": 3,
+      "sha256": "35f29636fa115c847ce39bc64758d3ca3e1662d446fb8bb44a098cdaf7354e91"
+    },
+    "metadata": {
+      "count": 7224,
+      "sha256": "2d2c16be75420a6acb1a04c41b239ba3c2ca5d948cae1f2433701ef82ac14ffb"
+    },
+    "parent-reset": {
+      "count": 1,
+      "sha256": "e518662876bd7dfd69102ee7e2a36672064df814624c10c8d39ca9574346de54"
+    },
+    "parents": {
+      "count": 1,
+      "sha256": "cc27e6baae5fa5072d7f4ee7f07e571951a68b40627054024da9ed763427e3c6"
+    },
+    "pipeline": {
+      "count": 1,
+      "sha256": "fd61df11cacdc3635e1418e4ab5938e9123298e14f1fbdc50f615f8d2fe343a4"
+    },
+    "record": {
+      "count": 270,
+      "sha256": "5ed471984183fe7087cd4d4c0ac21b3002041432f7314005d956b47f4c3f23d7"
+    },
+    "schema": {
+      "count": 1,
+      "sha256": "a11be01cc14ed1c6405849a2bbaacaf9d2bedd235554046d6a60e0749b69b7f9"
+    },
+    "schema-columns": {
+      "count": 1,
+      "sha256": "8a743925e7f74df253a3cd496dbbbb04537a8ab391c90988e6de38ac07e16695"
+    },
+    "timestamp-order": {
+      "count": 6,
+      "sha256": "8d63e4841cabf9239a4697b5c2643008941928fa3e57c978bffc526ef1578be4"
+    }
+  }
+}

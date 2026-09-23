@@ -78,7 +78,7 @@ finite numbers. NumPy numbers work for both. Booleans are rejected for both.
 | `metadata.py` | Sanitizes and redacts metadata, then encodes it as JSON within a byte budget. |
 | `failures.py` | Turns an exception into `error_class`, `error_message`, `stack_trace_hash`, and optional frames. |
 | `health.py` | `DeliveryHealth` and the thread-safe `DeliveryTracker`. |
-| `diagnostics.py` | `safe_text`, `truncate_text`, and `warn_safely`, which never raise. |
+| `diagnostics.py` | Bounded text and warnings. Text helpers require validated limits; `warn_safely` suppresses warning-handler failures. |
 | `timing.py` | UTC timestamps and monotonic durations. |
 | `errors.py` | Package exceptions, used only for setup mistakes. |
 | `sinks/` | Delivery. `base.py` defines the `EventSink` interface. |
@@ -87,6 +87,25 @@ finite numbers. NumPy numbers work for both. Booleans are rejected for both.
 The dependencies flow one way. `logger.py` uses everything below it, and the
 modules below it never import `logger.py`.
 
+`_state.py` groups delivery health and the parent ContextVar intentionally
+shared by bound loggers. `bind()` shallow-copies the logger, including subclass
+attributes, then replaces its top-level default-metadata dict. Configuration
+attributes are copied values: assigning a new sink or app name on one binding
+does not change another. Nested metadata and mutable subclass attributes retain
+the original shallow-sharing behavior. The ownership test must be updated when
+a package-owned logger attribute is added.
+
+`EventScope` defines its editable results once. Its result mapping is derived
+from public dataclass fields other than metadata, which is serialized separately.
+`EventLogger.event()` supplies one initial-result mapping to both validation and
+scope construction. Tests check every accepted result argument reaches emission.
+
+The supported imports are the package's exports, `databricks.resolve_context`,
+the existing sink modules, and the legacy `event`, `events`, and `serialization`
+modules. Legacy modules are warning-free aliases, including for old pickles.
+Helpers such as `DeliveryTracker`, `Column`, `copy_metadata`, and `wrap_in_scope`
+support the implementation; they are not new logger features or plugin hooks.
+
 ## Failure rules
 
 The most important rule: **logging must never change what the application
@@ -94,7 +113,8 @@ does.**
 
 - **Before work starts:** bad logger settings, bad fixed event fields, and
   non-mapping metadata raise right away. `EventLogger(...)` and `bind()`
-  also check the actual metadata content, including every key.
+  also check traversed metadata keys. Redacted values and branches beyond the
+  depth limit are not visited.
 - **At delivery:** anything that goes wrong while finishing or sending an
   event counts as a delivery failure. That includes bad metadata content,
   a bad value set on a scope, and a sink error. The failure is counted in
@@ -112,8 +132,9 @@ does.**
 
 `bind()` and `event(...)` copy the top level of the metadata dict, so adding
 or replacing keys doesn't affect the original. Nested lists and dicts stay
-shared until the event is serialized. Changes made to them after that point
-are checked at delivery, under the delivery failure rules.
+shared until the event is serialized. Changes made before serialization are
+checked at delivery, under the delivery failure rules. Later changes cannot
+alter an event's already-encoded metadata JSON.
 
 Serialization, in `metadata.py`:
 
@@ -124,8 +145,10 @@ Serialization, in `metadata.py`:
   are turned into dict keys first, so they are redacted too.
 - Replaces unknown objects, too-deep nesting, and NaN or infinity with fixed
   markers. `repr()` is never called.
-- Shortens long strings, and replaces JSON that is too big with a summary
-  that includes a preview.
+- Shortens input strings, and replaces oversized JSON with a summary. A preview
+  is included only when it fits. Smaller budgets produce a size/flag summary,
+  just `{"_truncated":true}`, or `{}`. Generated redaction/depth markers are
+  not shortened by the per-string limit.
 - Writes ASCII-only JSON with sorted keys, so the output is always valid UTF-8.
 
 Redaction only checks key names. It can't find a secret written inside free
@@ -146,11 +169,18 @@ its bound loggers. Separate loggers track parents separately.
 ## Error details
 
 `error_message` is shortened free text. It is not checked for secrets.
-`stack_trace_hash` is a SHA-256 of the exception type and the code locations
-it passed through, so failures from the same place share a hash. With
+`stack_trace_hash` is a SHA-256 of the exception type and captured code locations.
+Identical captured stacks share a hash, independent of the message. With
 `capture_error_frames=True`, `error_frames_json` stores up to 20 frames. Each
 frame has only the file name, function name, and line number. Source code
 and local variables are never stored.
+
+The SDK's scope and decorator frames use the original 0.1.3 storage locations
+from `77f33cf`, registered in `_trace_compat.py`. These legacy labels preserve
+existing application-failure hashes across this refactor; their line numbers
+are not links into current SDK source. Application frames are never rewritten.
+Python's raised exception and traceback are never changed. Other stack changes,
+including changes in application code or dependency versions, can change hashes.
 
 ## Delta storage
 
@@ -161,9 +191,14 @@ and local variables are never stored.
 3. It runs `INSERT INTO ... (columns) SELECT columns FROM view`.
 4. It drops the view.
 
-If the view can't be dropped, the sink only warns. That way a cleanup
-problem never hides an insert error, and a successful insert is never
-reported as failed. The sink never creates the table.
+Once registration returns, cleanup is attempted even if SQL execution or
+collection fails. Registration itself is outside that cleanup boundary; a
+registration error does not trigger a drop. Ordinary cleanup exceptions only
+warn, preserving any insert exception and not converting an acknowledged insert
+to failure. Cleanup interrupts such as KeyboardInterrupt still propagate and
+can replace an insert error. These are the existing sink semantics. When an
+application exception is already active, the logger still preserves it over
+any sink failure. The sink never creates the table.
 
 `event_date` is the UTC date of `event_ts`. In a query session that uses a
 different timezone, `to_date(event_ts)` can show a different date near

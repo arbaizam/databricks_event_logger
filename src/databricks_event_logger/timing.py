@@ -4,8 +4,8 @@ Events use two different clocks:
 
 - Wall-clock UTC time (``utc_now``) for timestamps that people and queries read.
 - A monotonic timer (``monotonic_ms``) for durations. The system clock can
-  jump, for example after a time sync, but this timer only moves forward, so
-  durations are always correct.
+  jump, for example after a time sync. This timer avoids those jumps when
+  measuring elapsed work; durations are rounded to whole milliseconds.
 """
 
 from __future__ import annotations

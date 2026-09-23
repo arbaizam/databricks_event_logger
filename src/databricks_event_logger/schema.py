@@ -15,7 +15,17 @@ from typing import NamedTuple
 
 
 class Column(NamedTuple):
-    """One column in the event table."""
+    """One storage column used to generate DDL, Spark types, and validation.
+
+    Args:
+        name: Key in EventRecord.as_dict().
+        sql_type: STRING, TIMESTAMP, DATE, BIGINT or DOUBLE. A new type also
+            needs a conversion in sinks.delta._spark_schema.
+        nullable: Whether the column can store NULL.
+
+    This NamedTuple stores values without validating them. It is an internal
+    schema declaration, not a way to add columns to an existing logger at runtime.
+    """
 
     name: str
     sql_type: str  # A Spark SQL type name, such as "STRING" or "BIGINT".

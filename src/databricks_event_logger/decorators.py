@@ -17,6 +17,8 @@ from contextlib import AbstractContextManager
 from functools import wraps
 from typing import Any, TypeVar, cast
 
+from databricks_event_logger._trace_compat import _legacy_wrapper
+
 F = TypeVar("F", bound=Callable[..., Any])
 
 
@@ -31,8 +33,14 @@ def wrap_in_scope(func: F, open_scope: Callable[[], AbstractContextManager[Any]]
         open_scope: A function that returns a new context manager, such as
             ``lambda: logger.event("name")``.
 
+    Returns:
+        A function with the original signature available through __wrapped__.
+        For async functions its result must be awaited.
+
     Raises:
         TypeError: If ``func`` is a generator or async generator function.
+        BaseException: Calling the wrapper propagates errors according to the
+            supplied context manager. EventLogger supplies its failure policy.
     """
     if inspect.isgeneratorfunction(func) or inspect.isasyncgenfunction(func):
         raise TypeError(
@@ -43,6 +51,7 @@ def wrap_in_scope(func: F, open_scope: Callable[[], AbstractContextManager[Any]]
     if inspect.iscoroutinefunction(func):
 
         @wraps(func)
+        @_legacy_wrapper
         async def async_wrapper(*args: Any, **kwargs: Any) -> Any:
             # The scope stays open until the awaited work has finished.
             with open_scope():
@@ -51,6 +60,7 @@ def wrap_in_scope(func: F, open_scope: Callable[[], AbstractContextManager[Any]]
         return cast(F, async_wrapper)
 
     @wraps(func)
+    @_legacy_wrapper
     def wrapper(*args: Any, **kwargs: Any) -> Any:
         with open_scope():
             return func(*args, **kwargs)

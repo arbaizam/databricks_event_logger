@@ -28,6 +28,24 @@ class RuntimeContext:
     ``workspace_url`` is reduced to a lowercase hostname, so
     ``"https://ADB-1.example.net/path"`` becomes ``"adb-1.example.net"``.
 
+    Attributes:
+        workspace_id: Workspace identifier.
+        workspace_url: Workspace hostname or HTTP(S) URL, stored as a hostname.
+        cluster_id: Compute cluster identifier.
+        job_id: Job definition identifier.
+        run_id: Job run identifier.
+        task_key: Task name/key within the job definition.
+        task_run_id: Task execution identifier.
+        task_attempt_number: Task attempt number, stored as text.
+        job_start_time: Job start time supplied by the caller, stored as text.
+        job_trigger_type: How the job was started, stored as text.
+        notebook_path: Notebook path supplied by the caller.
+        user_name: User associated with the execution context.
+        run_as_user_name: Identity under which the work runs.
+
+    Identifiers are not checked against a workspace. Only exact built-in str
+    and int values are accepted; bool and subclasses are rejected.
+
     Raises:
         TypeError: If a value isn't a ``str``, an ``int``, or ``None``.
         ValueError: If ``workspace_url`` isn't a hostname or HTTP(S) URL.
@@ -59,10 +77,18 @@ class RuntimeContext:
     def from_mapping(cls, values: Mapping[str, Any] | None) -> RuntimeContext:
         """Build a context from a dict that uses the field names above.
 
+        Args:
+            values: Mapping of field names to values, or None for an empty context.
+
+        Returns:
+            A normalized RuntimeContext, using the constructor's validation.
+
         Raises:
             TypeError: If ``values`` isn't a mapping, or if it contains an
                 unknown key. Unknown keys are rejected so that typos like
-                ``"jobid"`` are caught instead of silently ignored.
+                ``"jobid"`` are caught instead of silently ignored. Also raised
+                for invalid identifier types, as in the constructor.
+            ValueError: An invalid workspace hostname/URL, as in the constructor.
         """
         if values is not None and not isinstance(values, Mapping):
             raise TypeError("values must be a mapping or None.")

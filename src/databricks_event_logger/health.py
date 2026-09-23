@@ -19,8 +19,9 @@ MAX_LAST_ERROR_CHARS = 500
 class DeliveryHealth:
     """A read-only snapshot of delivery counts.
 
-    Every event counts as one attempt. An attempt then either succeeds or
-    fails. It fails if the event couldn't be built (for example, because of
+    Each delivery counts as one attempt; setup validation does not. An attempt
+    then either succeeds or fails. During delivery, it fails if the final record
+    couldn't be built (for example, because of
     invalid metadata) or if the sink raised an error.
 
     Attributes:
@@ -38,7 +39,12 @@ class DeliveryHealth:
 
 
 class DeliveryTracker:
-    """Thread-safe counters behind ``DeliveryHealth``."""
+    """Internal counter owner shared by bound loggers; starts with zero counts.
+
+    Call record_attempt before delivery, then record_success or record_failure.
+    Each update is locked separately, so a snapshot can include in-flight attempts.
+    Consumers should read EventLogger.health rather than update this tracker.
+    """
 
     def __init__(self) -> None:
         self._lock = Lock()
@@ -50,14 +56,23 @@ class DeliveryTracker:
             return self._health
 
     def record_attempt(self) -> None:
+        """Increment attempted before preparing a final event; return None."""
         with self._lock:
             self._health = replace(self._health, attempted=self._health.attempted + 1)
 
     def record_success(self) -> None:
+        """Increment succeeded after the sink returns; leave last_error unchanged."""
         with self._lock:
             self._health = replace(self._health, succeeded=self._health.succeeded + 1)
 
     def record_failure(self, error: BaseException) -> None:
+        """Increment failed and retain diagnostic text for error; return None.
+
+        Args:
+            error: Preparation or sink failure. Its message is bounded to 500
+                characters, preceded by the exception class name. A broken
+                __str__ is replaced by an unprintable marker.
+        """
         # Build the text before taking the lock, because str(error) runs user code.
         message = f"{type(error).__name__}: {safe_text(error, max_chars=MAX_LAST_ERROR_CHARS)}"
         with self._lock:

@@ -18,7 +18,7 @@ Package layout (each module does one job):
 ``metadata.py``         Turns metadata into small, redacted JSON.
 ``failures.py``         Describes an exception as event fields.
 ``health.py``           ``DeliveryHealth`` counters.
-``diagnostics.py``      Safe text and warnings that never raise.
+``diagnostics.py``      Bounded text and failure-tolerant warnings.
 ``timing.py``           UTC timestamps and monotonic durations.
 ``errors.py``           Package exceptions.
 ``sinks/``              Where events go: console, memory, Delta.

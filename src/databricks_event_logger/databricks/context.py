@@ -3,10 +3,11 @@
 ``resolve_context`` combines two sources. Explicit values always win:
 
 1. **Discovered values:** one attempt to read the notebook's context JSON
-   through ``dbutils``. If that fails for any reason, it contributes nothing.
+   through ``dbutils``. An ordinary exception makes it contribute nothing;
+   interrupts such as KeyboardInterrupt still propagate.
    This is common on restricted or serverless compute.
 2. **Explicit values:** values you pass in, usually job task parameters such
-   as ``{{job.run_id}}``. These always work, so use them when you need
+   as ``{{job.run_id}}``. Valid explicit values bypass discovery, so use them for
    reliable job and task IDs.
 
 No other sources are checked. That includes environment variables, the Spark
@@ -63,9 +64,16 @@ def resolve_context(
             override discovered values, and an explicit ``None`` clears one.
 
     Raises:
-        TypeError: If ``values`` isn't a mapping, or has an unknown key.
-        ValueError: If an explicit value is invalid. Only discovered values
-            are allowed to fail quietly.
+        TypeError: Non-mapping values, unknown explicit keys or invalid explicit
+            identifier types, as described by RuntimeContext.
+        ValueError: An invalid explicit workspace hostname/URL.
+        BaseException: Discovery interrupts such as KeyboardInterrupt.
+
+    Returns:
+        A RuntimeContext. Wrong-typed/blank discovered values are skipped.
+        If normalization of accepted discovered values fails (for example an
+        invalid workspace URL), all discovery is discarded before explicit
+        values are applied. Explicit None clears a discovered value.
     """
     if values is not None and not isinstance(values, Mapping):
         raise TypeError("values must be a mapping or None.")
@@ -77,8 +85,8 @@ def resolve_context(
 def _discover(dbutils: Any) -> dict[str, Any]:
     """Read ``RuntimeContext`` fields from the notebook context JSON.
 
-    Returns an empty dict if anything goes wrong: no access, bad JSON, or an
-    invalid value.
+    Returns an empty dict for ordinary lookup/normalization errors, such as
+    no access, bad JSON or an invalid workspace URL. Interrupts propagate.
     """
     try:
         notebook_context = dbutils.notebook.entry_point.getDbutils().notebook().getContext()

@@ -26,4 +26,12 @@ class EventSink(Protocol):
     """Anything with an ``emit(event)`` method can be used as a sink."""
 
     def emit(self, event: EventRecord) -> None:
-        """Deliver one event. Raise an exception if delivery fails."""
+        """Deliver one record synchronously; return None.
+
+        Args:
+            event: Finished EventRecord; use as_dict or as_json_dict for storage.
+
+        Raises:
+            Exception: The sink's own delivery error. EventLogger counts it
+                and applies its failure policy; the sink should not retry.
+        """

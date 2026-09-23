@@ -19,9 +19,10 @@ Supported values:
 - An enum becomes its value.
 - Dataclasses, named tuples, and PySpark ``Row`` objects become dicts, so
   their field names can be redacted.
-- NumPy numbers become ``int`` or ``float``.
+- NumPy integer and real-number scalars become ``int`` or ``float``.
+  NumPy booleans and complex numbers are unsupported.
 
-Anything else becomes ``UNSUPPORTED_VALUE``. NaN and infinity become
+Anything else becomes ``UNSUPPORTED_VALUE``. Non-finite real numbers become
 ``NONFINITE_VALUE``. Data nested too deeply becomes ``DEPTH_LIMIT_VALUE``.
 ``repr()`` is never called, so object contents can't leak by accident.
 
@@ -265,6 +266,9 @@ def _truncation_summary(encoded: str, max_bytes: int) -> str:
 
     # Find the longest preview that fits. Escaping changes the size in ways
     # that are hard to predict, so use a binary search over the preview length.
+    # Adding a character never shrinks its JSON encoding, so a failing length
+    # rules out every longer prefix. best keeps the last fitting candidate;
+    # it stays a summary without a preview when even an empty preview won't fit.
     shortest, longest = 0, min(len(encoded), max_bytes)
     while shortest <= longest:
         length = (shortest + longest) // 2

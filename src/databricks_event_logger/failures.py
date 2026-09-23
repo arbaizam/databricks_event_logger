@@ -1,4 +1,4 @@
-"""Describe an exception as event fields, without leaking sensitive data.
+"""Describe an exception using its message and a bounded list of code locations.
 
 When an operation fails, its event gets:
 
@@ -11,6 +11,8 @@ When an operation fails, its event gets:
 
 Only file names (not full paths), function names, and line numbers are
 recorded. Source code and local variables are never captured.
+Messages are free text, not redacted. Keep secrets out of exception messages.
+Scope/decorator locations retain their legacy storage labels; see ``_trace_compat``.
 """
 
 from __future__ import annotations
@@ -21,6 +23,7 @@ from collections import deque
 from pathlib import PurePath
 from typing import Any
 
+from databricks_event_logger._trace_compat import _legacy_frame
 from databricks_event_logger.diagnostics import safe_text
 from databricks_event_logger.enums import EventSeverity, EventStatus
 
@@ -66,7 +69,7 @@ def _traceback_frames(error: BaseException) -> list[dict[str, Any]]:
     trace = error.__traceback__
     while trace is not None:
         code = trace.tb_frame.f_code
-        frames.append({
+        frames.append(_legacy_frame(trace) or {
             "file": PurePath(code.co_filename).name[:MAX_FRAME_TEXT_CHARS],
             "function": code.co_name[:MAX_FRAME_TEXT_CHARS],
             "line": trace.tb_lineno,

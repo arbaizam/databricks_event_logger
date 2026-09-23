@@ -7,7 +7,8 @@ How one event is written:
 2. Register it as a temporary view with a unique name.
 3. Run ``INSERT INTO <table> (<columns>) SELECT <columns> FROM <view>``.
    Naming the columns means the table's column order doesn't matter.
-4. Drop the temporary view, even if the insert failed.
+4. After successful registration, attempt to drop the view even if insertion
+   fails. Registration failures do not enter the cleanup block.
 
 The sink never creates the table. Use ``create_table_sql()`` to get the SQL,
 then run it as part of your deployment. There is no buffering and no retry.
@@ -46,6 +47,9 @@ def create_table_sql(table_name: str) -> str:
 
     Raises:
         EventLoggerConfigurationError: If ``table_name`` isn't a valid three-part name.
+
+    Returns:
+        DDL using the declared columns and an event_date partition.
     """
     table_name = _check_table_name(table_name)
     columns = ",\n".join(
@@ -80,7 +84,17 @@ class DeltaSink:
         self.table_name = _check_table_name(self.table_name)
 
     def emit(self, event: EventRecord) -> None:
-        """Insert one event. Any Spark error is raised to the logger."""
+        """Insert one event synchronously; return None.
+
+        Args:
+            event: Validated EventRecord to store as one row.
+
+        Raises:
+            Exception: Spark preparation, registration or insert errors.
+            BaseException: Interrupts, including during cleanup. Ordinary
+                cleanup errors only warn; registration failure does not attempt
+                cleanup. Warning-handler failures are suppressed.
+        """
         row = event.as_dict()
         view_name = f"{_VIEW_PREFIX}{uuid4().hex}"
         dataframe = self.spark.createDataFrame(
@@ -110,7 +124,8 @@ class DeltaSink:
 
         Raises:
             EventLoggerConfigurationError: If the table can't be read, or its
-                schema doesn't match. The message lists every problem found.
+                schema doesn't match. Missing names are reported first; if none
+                are missing, all type/nullability problems are reported together.
         """
         try:
             actual = {column.name: column for column in self.spark.table(self.table_name).schema}
@@ -133,9 +148,9 @@ class DeltaSink:
     def _drop_view_quietly(self, view_name: str) -> None:
         """Drop the staging view. Warn instead of raising if it fails.
 
-        A failed cleanup must not hide an insert error. It also must not turn
-        a successful insert into a failure, because that would invite a retry
-        and a duplicate row.
+        Ordinary cleanup exceptions must not hide an insert error or turn an
+        acknowledged insert into a failure. Interrupts are deliberately not
+        caught, preserving the sink's existing behavior.
         """
         try:
             self.spark.catalog.dropTempView(view_name)

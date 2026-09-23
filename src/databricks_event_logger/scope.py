@@ -5,13 +5,14 @@ you set fields such as ``row_count`` or ``metadata`` as results come in.
 When the block exits, the logger reads these fields once and emits a single
 event. The timing and lifecycle code lives in ``EventLogger._run_scope``.
 
-To make another event field editable, add it here and to ``_result_fields()``.
-Then add a matching parameter to ``EventLogger.event()``.
+All public fields except ``metadata`` are event results. ``_result_fields``
+reads that list from this dataclass, so there is no second list to maintain.
+See CONTRIBUTING.md for adding a field and wiring its initial value.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from typing import Any
 
 from databricks_event_logger.record import EventRecord
@@ -21,6 +22,10 @@ from databricks_event_logger.record import EventRecord
 class EventScope:
     """The editable results of one operation. Emitted as one event when the block exits.
 
+    Obtain scopes from EventLogger.event(). Construction only stores values;
+    the logger validates initial values before entry and edited values at
+    delivery. The internal _event argument is the validated fixed record.
+
     Attributes:
         metadata: Extra key/value data. Add keys while the block runs.
         row_count: The number of rows the operation handled, if known.
@@ -29,6 +34,7 @@ class EventScope:
         severity: How important the event is, or ``None``.
         source_table: The table the operation read from.
         target_table: The table the operation wrote to.
+        event_id: Read-only ID taken from the fixed record.
 
     Example::
 
@@ -39,7 +45,8 @@ class EventScope:
     """
 
     # The fixed parts of the event, checked when the scope was created.
-    _template: EventRecord = field(repr=False)
+    # Keep the original name for existing constructors and serialized scopes.
+    _event: EventRecord = field(repr=False)
     metadata: dict[str, Any] = field(default_factory=dict)
     row_count: int | None = None
     status: str = "success"
@@ -50,7 +57,14 @@ class EventScope:
     @property
     def event_id(self) -> str:
         """The ID the final event will have. It's available before the event is emitted."""
-        return self._template.event_id
+        return self._event.event_id
+
+    def __setstate__(self, state: dict[str, Any]) -> None:
+        """Load scopes saved with either internal template-field name."""
+        state = dict(state)
+        if "_template" in state:
+            state["_event"] = state.pop("_template")
+        self.__dict__.update(state)
 
     def _result_fields(self) -> dict[str, Any]:
         """Return the editable ``EventRecord`` fields. The logger reads these on exit.
@@ -58,9 +72,7 @@ class EventScope:
         ``metadata`` isn't included, because it's merged and serialized separately.
         """
         return {
-            "row_count": self.row_count,
-            "status": self.status,
-            "severity": self.severity,
-            "source_table": self.source_table,
-            "target_table": self.target_table,
+            item.name: getattr(self, item.name)
+            for item in fields(self)
+            if not item.name.startswith("_") and item.name != "metadata"
         }
