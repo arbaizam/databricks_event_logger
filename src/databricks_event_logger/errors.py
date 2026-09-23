@@ -1,28 +1,16 @@
-"""
-Package-specific exceptions.
+"""Exceptions raised by this package.
 
-The logger is intentionally conservative about where it raises package errors.
-Business failures should remain visible to Databricks and to callers. Package
-exceptions are therefore used for configuration and direct API misuse, not for
-masking exceptions raised by user code.
+The package raises its own exceptions only for setup mistakes, like a bad
+table name. It never uses them to wrap or replace an exception raised by
+application code. The application's original exception always propagates.
 """
 
 from __future__ import annotations
 
 
 class EventLoggerError(Exception):
-    """
-    Base exception for package-owned failures.
-
-    Notes
-    -----
-    The logger should not raise this exception while handling an unrelated
-    business exception. In those paths the original business exception must be
-    preserved and re-raised.
-    """
+    """Base class for all exceptions raised by this package."""
 
 
 class EventLoggerConfigurationError(EventLoggerError):
-    """
-    Raised when logger configuration is invalid.
-    """
+    """Raised when the logger or a sink is set up incorrectly."""

@@ -1,4 +1,20 @@
-"""One best-effort notebook JSON lookup plus explicit job/task parameters."""
+"""Build a ``RuntimeContext`` from a Databricks notebook plus explicit values.
+
+``resolve_context`` combines two sources. Explicit values always win:
+
+1. **Discovered values:** one attempt to read the notebook's context JSON
+   through ``dbutils``. If that fails for any reason, it contributes nothing.
+   This is common on restricted or serverless compute.
+2. **Explicit values:** values you pass in, usually job task parameters such
+   as ``{{job.run_id}}``. These always work, so use them when you need
+   reliable job and task IDs.
+
+No other sources are checked. That includes environment variables, the Spark
+config, and stack inspection.
+
+To discover a new field, add it to ``RuntimeContext`` first, then map it to
+its notebook JSON key in ``_NOTEBOOK_JSON_KEYS`` below.
+"""
 
 from __future__ import annotations
 
@@ -8,7 +24,8 @@ from typing import Any
 
 from databricks_event_logger.context import RuntimeContext
 
-_JSON_NAMES = {
+# RuntimeContext field name -> key in the notebook context JSON.
+_NOTEBOOK_JSON_KEYS = {
     "workspace_id": "orgId",
     "workspace_url": "browserHostName",
     "cluster_id": "clusterId",
@@ -24,36 +41,63 @@ _JSON_NAMES = {
     "run_as_user_name": "runAsUserName",
 }
 
+# Sections of the notebook JSON whose keys are merged into the top level.
+_NESTED_SECTIONS = ("tags", "extraContext")
+
 
 def resolve_context(
     *, dbutils: Any = None, values: Mapping[str, Any] | None = None
 ) -> RuntimeContext:
-    """Enrich explicit context with supported notebook JSON fields.
+    """Return a ``RuntimeContext`` from notebook discovery plus explicit values.
 
-    Explicit canonical fields win, including None. Unknown explicit fields raise
-    rather than silently hiding typos. Missing, inaccessible, or malformed runtime
-    JSON contributes nothing. No environment, Spark-conf, tag-method, or caller
-    inspection fallbacks are attempted. Pass job/task parameters for guaranteed
-    identity on runtimes where notebook context JSON is restricted.
+    Example::
+
+        context = resolve_context(
+            dbutils=dbutils,
+            values={"job_id": dbutils.widgets.get("job_id")},
+        )
+
+    Args:
+        dbutils: The notebook's ``dbutils`` object, or ``None`` to skip discovery.
+        values: Explicit values keyed by ``RuntimeContext`` field name. They
+            override discovered values, and an explicit ``None`` clears one.
+
+    Raises:
+        TypeError: If ``values`` isn't a mapping, or has an unknown key.
+        ValueError: If an explicit value is invalid. Only discovered values
+            are allowed to fail quietly.
     """
     if values is not None and not isinstance(values, Mapping):
         raise TypeError("values must be a mapping or None.")
-    discovered: dict[str, Any] = {}
-    if dbutils is not None:
-        try:
-            context = dbutils.notebook.entry_point.getDbutils().notebook().getContext()
-            payload = json.loads(context.toJson())
-            if isinstance(payload, dict):
-                flattened = dict(payload)
-                for section in ("tags", "extraContext"):
-                    if isinstance(payload.get(section), dict):
-                        flattened.update(payload[section])
-                for name, json_name in _JSON_NAMES.items():
-                    value = flattened.get(name, flattened.get(json_name))
-                    if type(value) in (str, int) and str(value).strip():
-                        discovered[name] = value
-                discovered = RuntimeContext.from_mapping(discovered).as_dict()
-        except Exception:
-            discovered = {}
-    discovered.update(values or {})
-    return RuntimeContext.from_mapping(discovered)
+    merged = _discover(dbutils) if dbutils is not None else {}
+    merged.update(values or {})
+    return RuntimeContext.from_mapping(merged)
+
+
+def _discover(dbutils: Any) -> dict[str, Any]:
+    """Read ``RuntimeContext`` fields from the notebook context JSON.
+
+    Returns an empty dict if anything goes wrong: no access, bad JSON, or an
+    invalid value.
+    """
+    try:
+        notebook_context = dbutils.notebook.entry_point.getDbutils().notebook().getContext()
+        payload = json.loads(notebook_context.toJson())
+        if not isinstance(payload, dict):
+            return {}
+
+        flat = dict(payload)
+        for section in _NESTED_SECTIONS:
+            if isinstance(payload.get(section), dict):
+                flat.update(payload[section])
+
+        found = {}
+        for field_name, json_key in _NOTEBOOK_JSON_KEYS.items():
+            value = flat.get(field_name, flat.get(json_key))
+            if type(value) in (str, int) and str(value).strip():
+                found[field_name] = value
+        # Check the discovered values now, so a bad one is dropped here
+        # instead of breaking the final RuntimeContext.
+        return RuntimeContext.from_mapping(found).as_dict()
+    except Exception:
+        return {}

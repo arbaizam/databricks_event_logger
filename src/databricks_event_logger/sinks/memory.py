@@ -1,37 +1,26 @@
-"""
-In-memory sink for Databricks-hosted unit tests.
-
-The memory sink is intentionally tiny. Tests can assert against emitted
-``EventRecord`` objects without needing a real Delta table.
-"""
+"""``MemorySink``: keep events in a list, for tests."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from databricks_event_logger.event import EventRecord
+from databricks_event_logger.record import EventRecord
 
 
 @dataclass
 class MemorySink:
-    """
-    Store emitted events in a list.
+    """Store each event in ``events``, in the order it was emitted.
 
-    Attributes
-    ----------
-    events : list[EventRecord]
-        Events emitted through this sink, in emission order.
+    Example::
+
+        sink = MemorySink()
+        logger = EventLogger(sink=sink)
+        logger.record_event("done")
+        assert sink.events[0].event_name == "done"
     """
 
     events: list[EventRecord] = field(default_factory=list)
 
     def emit(self, event: EventRecord) -> None:
-        """
-        Store one event in memory.
-
-        Parameters
-        ----------
-        event : EventRecord
-            Event to append.
-        """
+        """Append ``event`` to ``events``."""
         self.events.append(event)

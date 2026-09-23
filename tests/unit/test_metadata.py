@@ -8,12 +8,11 @@ from pathlib import Path
 
 import pytest
 
-from databricks_event_logger.serialization import (
+from databricks_event_logger.diagnostics import TRUNCATED_MARKER, safe_text
+from databricks_event_logger.metadata import (
     DEPTH_LIMIT_VALUE,
     REDACTED_VALUE,
-    TRUNCATED_MARKER,
     UNSUPPORTED_VALUE,
-    safe_text,
     serialize_metadata,
 )
 

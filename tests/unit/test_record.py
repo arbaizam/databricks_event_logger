@@ -4,8 +4,8 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from databricks_event_logger.context import RuntimeContext
-from databricks_event_logger.event import EventRecord
-from databricks_event_logger.events import EventSeverity, EventStatus
+from databricks_event_logger.enums import EventSeverity, EventStatus
+from databricks_event_logger.record import EventRecord
 
 
 def test_event_snapshot_flattens_context_and_preserves_normalized_metadata():

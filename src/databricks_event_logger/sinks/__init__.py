@@ -1,4 +1,11 @@
-"""Event sink implementations."""
+"""Sinks: where events go after the logger builds them.
+
+- ``ConsoleSink``: prints each event as a JSON line. This is the default.
+- ``MemorySink``: keeps events in a list. Useful for tests.
+- ``DeltaSink``: inserts each event into an existing Delta table.
+
+To add your own sink, see ``EventSink`` in ``base.py``.
+"""
 
 from databricks_event_logger.sinks.base import EventSink
 from databricks_event_logger.sinks.console import ConsoleSink

@@ -14,8 +14,9 @@ from databricks_event_logger import (
     create_table_sql,
 )
 from databricks_event_logger.errors import EventLoggerConfigurationError
-from databricks_event_logger.event import EventRecord
-from databricks_event_logger.sinks.delta import EVENT_COLUMNS, EVENT_SCHEMA, _event_schema
+from databricks_event_logger.record import EventRecord
+from databricks_event_logger.schema import EVENT_COLUMNS, EVENT_SCHEMA
+from databricks_event_logger.sinks.delta import _spark_schema
 
 
 def test_memory_sink_stores_events_in_order():
@@ -191,7 +192,7 @@ def test_validate_wraps_table_access_failure():
 
 def test_validate_accepts_real_pyspark_schema_without_starting_spark():
     pytest.importorskip("pyspark")
-    DeltaSink(FakeSpark(table_schema=_event_schema()), "catalog.schema.events").validate()
+    DeltaSink(FakeSpark(table_schema=_spark_schema()), "catalog.schema.events").validate()
 
 
 def fake_field(name, data_type, nullable):
