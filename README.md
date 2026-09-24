@@ -61,6 +61,18 @@ Rules for scopes:
 - Never keep a scope open across a generator's `yield`. See
   [Observe functions](#observe-functions) for what to do instead.
 
+### Record data validations
+
+Use `event_type="validation"` to record whether a calculation agrees with an
+expected result. Your code performs the calculation and comparison, then sets
+the event's status and stores the actual value, expected value, and rule in
+metadata. Setting `status="failed"` records a mismatch; it does not raise an
+exception or stop the job.
+
+See the [data validation recipes](docs/data_validation_recipes.md) for row
+counts, exact decimal totals, comparisons with a tolerance, and several checks
+from one Spark aggregation. They use the existing API and storage schema.
+
 ### Shared metadata with `bind()`
 
 `logger.bind(**metadata)` returns a new logger that adds extra metadata to
@@ -312,6 +324,8 @@ Spark session's time zone.
 
 ## Examples and documentation
 
+- [Data validation recipes](docs/data_validation_recipes.md): compare DataFrame
+  calculations with expected results, record mismatches, and optionally stop work.
 - [Local developer notebook](notebooks/databricks_event_logger_developer_guide.py):
   scopes, nested events, decorators, the memory sink, and delivery health.
 - [Production notebook](notebooks/golden_path_notebook.py): job context, a
